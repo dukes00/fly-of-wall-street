@@ -35,6 +35,7 @@ import math
 import re
 
 import numpy as np
+import pandas as pd
 
 from fruitfly.senses._hash import _MASK64, stable_u64, stable_uniform
 
@@ -60,6 +61,59 @@ FEATURE_NEUTRAL = {"returns": 0.0, "rsi": 50.0, "volatility": 0.0, "volume_delta
 
 #: Number of glomerular channels (matches chassis.meta["glomeruli"]).
 _N_CHANNELS = 88
+
+
+
+#: Trailing windows used by :func:`build_features` (the shared feature
+#: builder): RSI period and volatility/volume lookback, in bars.
+RSI_PERIOD = 14
+VOL_WINDOW = 20
+
+
+def build_features(bars: pd.DataFrame, rsi_period: int = RSI_PERIOD, vol_window: int = VOL_WINDOW) -> dict[str, float]:
+    """Compute the four state features (``FEATURES``) from OHLCV bars.
+
+    This is THE shared feature builder: the smell channel's modulation
+    inputs and the T8 logistic control (``scoreboard.logistic_control``)
+    consume exactly these values.
+
+    Definitions (``close``/``volume`` columns; last row = now):
+
+    - ``returns``: simple last-bar return ``close[-1] / close[-2] - 1``.
+    - ``rsi``: mean-based (Cutler) RSI over ``rsi_period`` bars, on the
+      0-100 scale (gains/losses averaged with a plain mean over the
+      window).
+    - ``volatility``: sample std-dev (ddof=1) of the last ``vol_window``
+      simple close-to-close returns.
+    - ``volume_delta``: last bar's volume relative to the mean volume of
+      the preceding ``vol_window`` bars: ``volume[-1] / mean - 1``.
+
+    When the frame has too few rows for a feature, that feature takes its
+    neutral value (``FEATURE_NEUTRAL``) — the same convention
+    :func:`encode_smell` applies to a missing key. Pure and deterministic.
+    """
+    close = bars["close"].to_numpy(dtype=float)
+    volume = bars["volume"].to_numpy(dtype=float)
+    out: dict[str, float] = dict(FEATURE_NEUTRAL)
+    if len(close) < 2:
+        return out
+    rets = np.diff(close) / close[:-1]
+    out["returns"] = float(rets[-1])
+    if len(rets) >= vol_window:
+        out["volatility"] = float(np.std(rets[-vol_window:], ddof=1))
+    if len(close) >= rsi_period + 1:
+        deltas = np.diff(close[-(rsi_period + 1):])
+        avg_gain = float(np.maximum(deltas, 0.0).mean())
+        avg_loss = float(np.maximum(-deltas, 0.0).mean())
+        if avg_loss == 0.0:
+            out["rsi"] = 100.0 if avg_gain > 0.0 else 50.0
+        else:
+            out["rsi"] = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    if len(volume) >= vol_window + 1:
+        base = float(volume[-(vol_window + 1):-1].mean())
+        if base > 0.0:
+            out["volume_delta"] = float(volume[-1] / base - 1.0)
+    return out
 
 
 def _rsi(value: float) -> float:
