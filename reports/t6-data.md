@@ -28,6 +28,6 @@ Cache: `data/market/{SYMBOL}_1m.parquet`; contract: int64-ns UTC timestamps, OHL
 | ^GSPC | 7,799 | 2026-08-17 13:30:00+00:00 | 2026-09-14 19:59:00+00:00 | 20 | 0 |
 
 Full basket present.
-Timezone proof: `AAPL_1m.parquet` first timestamp 1786973400000000000 ns decodes to 2026-08-17 13:30:00+00:00 (tz=UTC).
+Timezone proof: `AAPL_1m.parquet` first timestamp 1786973400000000000 (ns) decodes to 2026-08-17 13:30:00+00:00 (tz=UTC).
 
 _Session filter: `is_regular_session` — NYSE holidays 2024-2027 hardcoded (source: nyse.com hours-calendars)._

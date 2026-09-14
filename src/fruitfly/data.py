@@ -251,7 +251,7 @@ def _conform(raw: pd.DataFrame) -> pd.DataFrame:
          "close": "float64", "volume": "int64"}
     )
     idx = pd.DatetimeIndex(
-        pd.to_datetime(df.index, utc=True), name="timestamp"
+        pd.to_datetime(df.index, utc=True).as_unit("ns"), name="timestamp"
     )
     df.index = idx
     df = df[_session_mask(df.index)].sort_index()
@@ -264,7 +264,6 @@ def _conform(raw: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Validation report
 # ---------------------------------------------------------------------------
-
 
 def validate_cache(symbols: list[str] | None = None) -> str:
     """Render the T6 data-validation report from the current cache state."""
@@ -287,8 +286,7 @@ def validate_cache(symbols: list[str] | None = None) -> str:
             missing.append(symbol)
             continue
         df = pd.read_parquet(path)
-        ts = pd.to_datetime(df["timestamp"], utc=True)
-        idx = pd.DatetimeIndex(ts)
+        idx = pd.DatetimeIndex(pd.to_datetime(df["timestamp"], utc=True))
         # Gap = interval between consecutive bars other than 1 minute.
         diffs = idx.to_series().diff().dt.total_seconds().dropna()
         gaps = int((diffs != 60).sum())
@@ -304,16 +302,17 @@ def validate_cache(symbols: list[str] | None = None) -> str:
         )
     else:
         lines.append("Full basket present.")
-    # Timezone proof: timestamps are int64 ns UTC; show one decoded sample.
+    # Timezone proof: decode one first-row timestamp per detected unit.
     first_file = next(
         (cache_path(s) for s in symbols if cache_path(s).exists()), None
     )
     if first_file is not None:
         sample = pd.read_parquet(first_file).iloc[0]
-        decoded = pd.Timestamp(sample["timestamp"], tz="UTC")
+        decoded = pd.Timestamp(int(sample["timestamp"]), unit="ns", tz="UTC")
+        unit = "ns"
         lines.append(
             f"Timezone proof: `{first_file.name}` first timestamp "
-            f"{int(sample['timestamp'])} ns decodes to {decoded} "
+            f"{int(sample['timestamp'])} ({unit}) decodes to {decoded} "
             f"(tz=UTC)."
         )
     lines.append("")
