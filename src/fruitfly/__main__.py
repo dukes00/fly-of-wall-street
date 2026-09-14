@@ -11,9 +11,15 @@ their subcommands here via the registry below.
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Callable, Sequence
 
 from fruitfly import __version__
+
+if __name__ == "__main__":  # runpy (`python -m fruitfly`): allow the
+    # circular import fruitfly.data -> fruitfly.__main__ below.
+    sys.modules.setdefault("fruitfly.__main__", sys.modules[__name__])
+
 
 CommandBuilder = Callable[[argparse._SubParsersAction], None]
 #: Registry of subcommands. Modules register builders here at import time.
@@ -27,6 +33,8 @@ def register_command(name: str, builder: CommandBuilder) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level parser with all registered subcommands."""
+    import fruitfly.data  # noqa: F401  # registers the fetch-data command
+
     parser = argparse.ArgumentParser(
         prog="python -m fruitfly",
         description="Fruit Fly of Wall Street: 166,691 neurons. Zero emotions.",
