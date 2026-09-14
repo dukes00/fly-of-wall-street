@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fruit Fly of Wall Street — live dashboard</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #171d24; --edge: #26303a;
+    --text: #d7e0e8; --dim: #7f8f9d;
+    --green: #4ade80; --red: #f87171; --amber: #fbbf24; --blue: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--edge);
+  }
+  header h1 { font-size: 14px; margin: 0; letter-spacing: 0.5px; }
+  header .meta { color: var(--dim); }
+  #status.live { color: var(--green); }
+  #status.waiting { color: var(--amber); }
+  main {
+    display: grid; gap: 12px; padding: 12px 16px;
+    grid-template-columns: 2fr 1fr;
+    grid-template-areas: "equity mbon" "neuron mbon" "events events";
+  }
+  section {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 10px 12px; min-width: 0;
+  }
+  section h2 {
+    margin: 0 0 8px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 1px; color: var(--dim);
+  }
+  #panel-equity { grid-area: equity; }
+  #panel-neuron { grid-area: neuron; }
+  main {
+    display: grid; gap: 12px; padding: 12px 16px;
+    grid-template-columns: 2fr 1fr;
+    grid-template-areas: "equity mbon" "neuron positions" "events events";
+  }
+  td.num, th.num { text-align: right; }
+  .big { font-size: 26px; font-weight: 700; }
+  #panel-positions { grid-area: positions; }
+  .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+  .row .k { color: var(--dim); }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  #eventlog {
+    margin: 0; padding: 0; list-style: none; max-height: 260px; overflow-y: auto;
+    white-space: nowrap;
+  }
+  #eventlog li { padding: 1px 0; border-bottom: 1px dashed #1d252e; overflow: hidden; text-overflow: ellipsis; }
+  #eventlog .t { color: var(--blue); display: inline-block; min-width: 8.5em; }
+  #eventlog .ts { color: var(--dim); display: inline-block; min-width: 15em; }
+  #conn { color: var(--dim); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FRUIT FLY OF WALL STREET</h1>
+  <span id="status" class="waiting">connecting…</span>
+  <span class="meta" id="rundir"></span>
+  <span class="meta" id="latest"></span>
+  <span class="meta" id="conn"></span>
+</header>
+<main>
+  <section id="panel-equity">
+    <h2>Equity</h2>
+    <canvas id="equity-canvas"></canvas>
+  </section>
+  <section id="panel-mbon">
+    <h2>MBON balance</h2>
+    <div class="big" id="mbon-balance">—</div>
+    <div class="row"><span class="k">raw balance</span><span id="mbon-raw">—</span></div>
+    <div class="row"><span class="k">valence readout</span><span id="mbon-valence">—</span></div>
+    <div class="row"><span class="k">MBON rate (Hz)</span><span id="mbon-rate">—</span></div>
+    <div class="row"><span class="k">encounters</span><span id="mbon-n">—</span></div>
+    <div class="row"><span class="k">last sniff</span><span id="mbon-last">—</span></div>
+    <h2 style="margin-top:12px">Neuromod state</h2>
+    <div class="row"><span class="k">reward</span><span id="nm-reward">—</span></div>
+    <div class="row"><span class="k">punishment</span><span id="nm-punishment">—</span></div>
+    <div class="row"><span class="k">hunger</span><span id="nm-hunger">—</span></div>
+    <div class="row"><span class="k">arousal</span><span id="nm-arousal">—</span></div>
+    <h2 style="margin-top:12px">Equity / cash</h2>
+    <div class="row"><span class="k">equity</span><span id="hd-equity">—</span></div>
+    <div class="row"><span class="k">cash</span><span id="hd-cash">—</span></div>
+    <div class="row"><span class="k">market value</span><span id="hd-mv">—</span></div>
+    <div class="row"><span class="k">hatch equity</span><span id="hd-hatch">—</span></div>
+    <div class="row"><span class="k">deaths</span><span id="hd-deaths">—</span></div>
+  </section>
+  <section id="panel-neuron">
+    <h2>Neuron activity — MBON rate &amp; approach/avoid balance (recent encounters)</h2>
+    <canvas id="neuron-canvas"></canvas>
+  </section>
+  <section id="panel-positions">
+    <h2>Open positions</h2>
+    <table>
+      <thead>
+        <tr><th>Ticker</th><th class="num">Shares</th><th class="num">Avg cost</th><th class="num">Weight</th></tr>
+      </thead>
+      <tbody id="positions-body"></tbody>
+    </table>
+  </section>
+  <section id="panel-events">
+    <h2>Event log tail</h2>
+    <ul id="eventlog"></ul>
+  </section>
+</main>
+<script>
+"use strict";
+var $ = function (id) { return document.getElementById(id); };
+
+function fmt(x, d) {
+  if (x === null || x === undefined) return "—";
+  return Number(x).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+function cls(x) { return x > 0 ? "pos" : (x < 0 ? "neg" : ""); }
+
+// ---- canvas sizing (device-pixel sharp, no external deps) ------------------
+function fit(cv) {
+  var dpr = window.devicePixelRatio || 1;
+  var w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr || cv.height !== h * dpr) {
+    cv.width = w * dpr; cv.height = h * dpr;
+  }
+  var ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx: ctx, w: w, h: h };
+}
+
+// ---- equity chart -----------------------------------------------------------
+function drawEquity(series, hatch) {
+  var cv = $("equity-canvas");
+  var g = fit(cv), ctx = g.ctx, W = g.w, H = g.h;
+  ctx.clearRect(0, 0, W, H);
+  if (!series || series.length < 2) {
+    ctx.fillStyle = "#7f8f9d"; ctx.fillText("waiting for bars…", 8, 16); return;
+  }
+  var vals = series.map(function (r) { return r[1]; });
+  if (hatch !== null && hatch !== undefined) vals = vals.concat([hatch]);
+  var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  if (hi - lo < 1e-9) { hi += 1; lo -= 1; }
+  var pad = 6, x0 = 52, x1 = W - pad, y0 = pad, y1 = H - 18;
+  function X(i) { return x0 + (x1 - x0) * i / (series.length - 1); }
+  function Y(v) { return y1 - (y1 - y0) * (v - lo) / (hi - lo); }
+  // grid + axis labels
+  ctx.strokeStyle = "#26303a"; ctx.fillStyle = "#7f8f9d";
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  for (var k = 0; k <= 3; k++) {
+    var v = lo + (hi - lo) * k / 3, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+    ctx.fillText(v.toFixed(0), 2, y + 3);
+  }
+  // hatch line
+  if (hatch !== null && hatch !== undefined) {
+    ctx.strokeStyle = "#7f8f9d"; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(x0, Y(hatch)); ctx.lineTo(x1, Y(hatch)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // equity line, colored by sign of return
+  var up = series[series.length - 1][1] >= series[0][1];
+  ctx.strokeStyle = up ? "#4ade80" : "#f87171"; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (var i = 0; i < series.length; i++) {
+    var px = X(i), py = Y(series[i][1]);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.stroke(); ctx.lineWidth = 1;
+}
+
+// ---- neuron-activity chart --------------------------------------------------
+// Bars: centered approach/avoid balance in [-1, 1] (green approach, red avoid).
+// Line: MBON population firing rate (Hz), scaled to the window's max.
+function drawNeuron(recent) {
+  var cv = $("neuron-canvas");
+  var g = fit(cv), ctx = g.ctx, W = g.w, H = g.h;
+  ctx.clearRect(0, 0, W, H);
+  if (!recent || !recent.length) {
+    ctx.fillStyle = "#7f8f9d"; ctx.fillText("no encounters yet…", 8, 16); return;
+  }
+  var pad = 6, x0 = 30, x1 = W - pad, y0 = pad, y1 = H - 18;
+  var mid = (y0 + y1) / 2;
+  // zero line
+  ctx.strokeStyle = "#26303a";
+  ctx.beginPath(); ctx.moveTo(x0, mid); ctx.lineTo(x1, mid); ctx.stroke();
+  var n = recent.length;
+  var slot = (x1 - x0) / n, bw = Math.max(1, slot * 0.6);
+  var maxRate = 0;
+  for (var i = 0; i < n; i++) maxRate = Math.max(maxRate, recent[i].mbon_rate_hz || 0);
+  for (var j = 0; j < n; j++) {
+    var b = Math.max(-1, Math.min(1, recent[j].balance || 0));
+    var bx = x0 + slot * j + (slot - bw) / 2;
+    var bh = (y1 - y0) / 2 * b;
+    ctx.fillStyle = b >= 0 ? "#4ade80" : "#f87171";
+    if (b >= 0) ctx.fillRect(bx, mid - bh, bw, bh);
+    else ctx.fillRect(bx, mid, bw, -bh);
+  }
+  // MBON rate line (amber), scaled to its own max
+  if (maxRate > 0) {
+    ctx.strokeStyle = "#fbbf24"; ctx.beginPath();
+    for (var m = 0; m < n; m++) {
+      var ly = y1 - (y1 - y0) * (recent[m].mbon_rate_hz || 0) / maxRate;
+      var lx = x0 + slot * m + slot / 2;
+      if (m === 0) ctx.moveTo(lx, ly); else ctx.lineTo(lx, ly);
+    }
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#7f8f9d"; ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.fillText("+1", 2, y0 + 8); ctx.fillText("0", 2, mid + 3); ctx.fillText("-1", 2, y1);
+  ctx.fillText("MBON Hz max " + maxRate.toFixed(1), x0 + 4, y0 + 8);
+}
+
+// ---- panels -----------------------------------------------------------------
+function render(s) {
+  var st = $("status");
+  st.textContent = s.status;
+  st.className = s.status;
+  $("rundir").textContent = s.run_dir;
+  $("latest").textContent = s.latest_ts ? ("bar " + s.latest_ts + " · " + s.n_bars + " bars") : "";
+  $("hd-equity").textContent = fmt(s.equity, 2);
+  $("hd-cash").textContent = fmt(s.cash, 2);
+  $("hd-mv").textContent = fmt(s.market_value, 2);
+  $("hd-hatch").textContent = fmt(s.hatch_equity, 2);
+  $("hd-deaths").textContent = s.deaths;
+  drawEquity(s.equity_series, s.hatch_equity);
+
+  var m = s.mbon;
+  $("mbon-balance").textContent = m ? fmt(m.balance, 4) : "—";
+  $("mbon-balance").className = "big " + (m ? cls(m.balance) : "");
+  $("mbon-raw").textContent = m ? fmt(m.raw_balance, 4) : "—";
+  $("mbon-valence").textContent = m ? fmt(m.valence_readout, 4) : "—";
+  $("mbon-rate").textContent = m ? fmt(m.mbon_rate_hz, 2) : "—";
+  $("mbon-n").textContent = s.n_encounters;
+  $("mbon-last").textContent = m ? (m.ticker + " @ " + m.ts) : "—";
+  var nm = s.neuromod;
+  $("nm-reward").textContent = nm ? fmt(nm.reward, 4) : "—";
+  $("nm-punishment").textContent = nm ? fmt(nm.punishment, 4) : "—";
+  $("nm-hunger").textContent = nm ? fmt(nm.hunger, 4) : "—";
+  $("nm-arousal").textContent = nm ? fmt(nm.arousal, 4) : "—";
+  drawNeuron(s.neuron_activity && s.neuron_activity.recent);
+
+  var tb = $("positions-body");
+  tb.innerHTML = "";
+  (s.positions || []).forEach(function (p) {
+    var tr = document.createElement("tr");
+    var weight = (s.equity && s.equity > 0) ? (100 * p.shares * p.avg_cost / s.equity) : 0;
+    [p.ticker, p.shares, fmt(p.avg_cost, 2), fmt(weight, 1) + "%"].forEach(function (v, i) {
+      var td = document.createElement("td");
+      if (i > 0) td.className = "num";
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+  if (!(s.positions || []).length) {
+    var tr0 = document.createElement("tr");
+    var td0 = document.createElement("td");
+    td0.colSpan = 4; td0.textContent = "no open positions";
+    td0.style.color = "#7f8f9d";
+    tr0.appendChild(td0); tb.appendChild(tr0);
+  }
+}
+
+function describe(ev) {
+  if (ev.type === "order") return ev.side + " " + ev.shares + " " + ev.ticker + " @ " + ev.price + " (" + ev.reason + ")";
+  if (ev.type === "encounter") return ev.ticker + " balance " + ev.balance + " (" + ev.mbon_rate_hz + " Hz)";
+  if (ev.type === "decision") return ev.ticker + " → " + ev.action + " (" + ev.reason + ")";
+  if (ev.type === "sugar_shock") return "reward " + ev.reward + " punishment " + ev.punishment + " hunger " + ev.hunger;
+  if (ev.type === "death") return "equity " + ev.equity + " ≤ " + ev.hatch_equity + " · hatching fresh fly";
+  if (ev.type === "hatch") return "hatch equity " + ev.hatch_equity;
+  if (ev.type === "wake" || ev.type === "sleep") return "";
+  return JSON.stringify(ev);
+}
+
+function refreshEvents() {
+  fetch("/api/events?limit=40").then(function (r) { return r.json(); }).then(function (res) {
+    var ul = $("eventlog");
+    ul.innerHTML = "";
+    res.events.forEach(function (ev) {
+      var li = document.createElement("li");
+      var t = document.createElement("span"); t.className = "t"; t.textContent = ev.type;
+      var ts = document.createElement("span"); ts.className = "ts"; ts.textContent = ev.ts || "";
+      li.appendChild(t); li.appendChild(ts);
+      li.appendChild(document.createTextNode(describe(ev)));
+      ul.appendChild(li);
+    });
+    ul.scrollTop = ul.scrollHeight;
+  });
+}
+
+// ---- SSE push (auto-reconnects; server polls receipts on a fixed interval) --
+var es = new EventSource("/api/stream");
+es.addEventListener("state", function (e) {
+  $("conn").textContent = "sse live";
+  render(JSON.parse(e.data));
+  refreshEvents();
+});
+es.onopen = function () { $("conn").textContent = "sse live"; };
+es.onerror = function () { $("conn").textContent = "sse reconnecting…"; };
+
+// immediate first paint (SSE pushes the same snapshot right after)
+fetch("/api/state").then(function (r) { return r.json(); }).then(render);
+refreshEvents();
+window.addEventListener("resize", function () {
+  fetch("/api/state").then(function (r) { return r.json(); }).then(render);
+});
+</script>
+</body>
+</html>

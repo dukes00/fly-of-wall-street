@@ -33,6 +33,7 @@ def register_command(name: str, builder: CommandBuilder) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level parser with all registered subcommands."""
+    import fruitfly.dashboard  # noqa: F401  # registers the dashboard command
     import fruitfly.data  # noqa: F401  # registers the fetch-data command
     import fruitfly.loop  # noqa: F401  # registers the backtest command
 
