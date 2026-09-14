@@ -70,7 +70,11 @@ RSI_PERIOD = 14
 VOL_WINDOW = 20
 
 
-def build_features(bars: pd.DataFrame, rsi_period: int = RSI_PERIOD, vol_window: int = VOL_WINDOW) -> dict[str, float]:
+def build_features(
+    bars: pd.DataFrame,
+    rsi_period: int = RSI_PERIOD,
+    vol_window: int = VOL_WINDOW,
+) -> dict[str, float]:
     """Compute the four state features (``FEATURES``) from OHLCV bars.
 
     This is THE shared feature builder: the smell channel's modulation

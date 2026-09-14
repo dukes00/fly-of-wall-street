@@ -51,7 +51,8 @@ SPIVA_ROW = {
     "name": "SPIVA: active large-cap funds underperforming S&P 500",
     "category": "All Large-Cap vs S&P 500",
     "underperforming_pct": {"1y": 78.78, "3y": 66.84, "5y": 88.96, "15y": 89.93},
-    "source": "S&P Dow Jones Indices, SPIVA U.S. Scorecard Year-End 2025 (data as of Dec. 31, 2025)",
+    "source": ("S&P Dow Jones Indices, SPIVA U.S. Scorecard Year-End 2025 "
+               "(data as of Dec. 31, 2025)"),
     "url": "https://www.spglobal.com/spdji/en/research-insights/spiva/",
     "accessed": "2026-09-15",
     "note": (
@@ -271,7 +272,7 @@ def logistic_control(
 
     # Trade: at bar t, hold symbols with P > threshold and a known next-bar
     # return; equal split, full investment; realized on the next bar.
-    held = (P > threshold) & R.notna()
+    held = (threshold < P) & R.notna()
     port_ret = R.where(held).mean(axis=1).fillna(0.0)
     step = port_ret.shift(1)  # decision made at the previous bar
     step.iloc[0] = 0.0
@@ -284,7 +285,8 @@ def logistic_control(
         "features standardized with train-set mean/std",
         "feature_builder": "fruitfly.senses.smell.build_features",
         "features": list(FEATURES),
-        "coefficients": {f: float(c) for f, c in zip(FEATURES, model.coef_[0])},
+        "coefficients": {f: float(c) for f, c in
+                         zip(FEATURES, model.coef_[0], strict=True)},
         "intercept": float(model.intercept_[0]),
         "threshold": float(threshold),
         "train_fraction": float(train_fraction),
@@ -421,8 +423,8 @@ def compare_run(
         f"- Window: {start} .. {end} (inclusive), capital {capital:,.0f}",
         f"- Grid: fly equity curve, {len(grid)} bars "
         f"({grid[0]} .. {grid[-1]})",
-        f"- Benchmarks computed on the same universe and bar grid; S&P 500 "
-        f"interpolated from daily ^GSPC closes.",
+        "- Benchmarks computed on the same universe and bar grid; S&P 500 "
+        "interpolated from daily ^GSPC closes.",
         "",
         "## Scoreboard",
         "",
@@ -458,7 +460,7 @@ def compare_run(
         f"- Features: {', '.join(control_summary['features'])} — built by "
         f"`{control_summary['feature_builder']}` (the smell channel's shared builder).",
         f"- {control_summary['model']}",
-        f"- Coefficients: "
+        "- Coefficients: "
         + ", ".join(f"{f}={c:+.4f}" for f, c in control_summary["coefficients"].items())
         + f", intercept={control_summary['intercept']:+.4f}",
         f"- Train rows: {control_summary['train_rows']} (up-rate "

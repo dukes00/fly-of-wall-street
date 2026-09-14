@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from fruitfly.senses.smell import (
     FEATURE_NEUTRAL,
-    FEATURES,
     build_features,
     encode_smell,
     identity_profile,

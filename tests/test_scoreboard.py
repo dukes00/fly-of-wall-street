@@ -18,8 +18,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fruitfly.senses import FEATURE_NEUTRAL, FEATURES, encode_smell
-from fruitfly.senses.smell import RSI_PERIOD, VOL_WINDOW, build_features
 from fruitfly.scoreboard import (
     SPIVA_ROW,
     compare_run,
@@ -28,6 +26,8 @@ from fruitfly.scoreboard import (
     monkey_darts,
     spx_buyhold,
 )
+from fruitfly.senses import FEATURE_NEUTRAL, FEATURES, encode_smell
+from fruitfly.senses.smell import RSI_PERIOD, VOL_WINDOW, build_features
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 import charts  # noqa: E402
