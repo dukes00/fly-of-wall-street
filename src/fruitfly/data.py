@@ -15,6 +15,7 @@ pandas-market-calendars for 2024-2027. Hardcoded for determinism; no network.
 from __future__ import annotations
 
 import argparse
+import time as _time
 from datetime import UTC, date, time
 from pathlib import Path
 
@@ -163,6 +164,37 @@ def load_bars(
 # ---------------------------------------------------------------------------
 
 
+def _chunk_window(
+    start: pd.Timestamp, end: pd.Timestamp, days: int = 7
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Split ``[start, end)`` into contiguous calendar windows of <= ``days``
+    days. Yahoo caps 1m granularity fetches at 8 days per request."""
+    if end <= start:
+        return [(start, end)]
+    chunks: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    lo = start
+    step = pd.Timedelta(days=days)
+    while lo < end:
+        hi = min(lo + step, end)
+        chunks.append((lo, hi))
+        lo = hi
+    return chunks
+
+
+def _fetch_history_with_retry(label: str, fn, tries: int = 6):
+    """Retry ``fn`` on transient failures; raise on final exhaustion so a
+    partial cache is never written."""
+    last: Exception | None = None
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - yfinance raises variety
+            last = exc
+            if attempt < tries - 1:
+                _time.sleep(2.0 * (attempt + 1))
+    raise RuntimeError(f"fetch failed after {tries} attempts: {label}") from last
+
+
 def fetch_symbols(
     symbols: list[str], days: int = 25, start: str | None = None,
     end: str | None = None,
@@ -170,28 +202,40 @@ def fetch_symbols(
     """Fetch 1-minute bars via yfinance, session-filter, write cache.
 
     Requires network. Yields contract-conformant parquet files under
-    ``data/market/``. yfinance's ``yf.Ticker(symbol).history()`` already
-    returns regular-session-only 1m bars for US equities; we re-apply the
-    session mask defensively.
+    ``data/market/``. Yahoo caps 1m fetches at 8 days per request, so any
+    window spanning more than 7 calendar days is fetched in <=7-day chunks
+    and merged. Per-chunk failures retry, then raise — never partial data.
     """
     import yfinance as yf  # deferred: offline tests never need it
 
-    kwargs: dict[str, object] = {"interval": "1m"}
+    now = pd.Timestamp.now(tz="UTC")
     if start is not None:
-        kwargs["start"] = start
-    if end is not None:
-        kwargs["end"] = end
+        win_start = pd.Timestamp(start, tz="UTC")
+        win_end = pd.Timestamp(end, tz="UTC") if end is not None else now
     else:
-        kwargs["period"] = f"{days}d"
+        win_end = pd.Timestamp(end, tz="UTC") if end is not None else now
+        win_start = win_end - pd.Timedelta(days=days)
+    chunks = _chunk_window(win_start, win_end)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     result: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
-        raw = yf.Ticker(symbol).history(**kwargs)  # type: ignore[arg-type]
-        if raw is None or raw.empty:
+        frames: list[pd.DataFrame] = []
+        for lo, hi in chunks:
+            label = f"{symbol} {lo:%Y-%m-%d}..{hi:%Y-%m-%d}"
+            raw = _fetch_history_with_retry(
+                label,
+                lambda lo=lo, hi=hi, symbol=symbol: yf.Ticker(symbol).history(
+                    start=lo.to_pydatetime(), end=hi.to_pydatetime(),
+                    interval="1m",
+                ),
+            )
+            if raw is not None and not raw.empty:
+                frames.append(raw)
+        if not frames:
             result[symbol] = pd.DataFrame(columns=_COLUMNS[1:])
             continue
-        df = _conform(raw)
+        df = _conform(pd.concat(frames))
         df.to_parquet(cache_path(symbol), index=False)
         result[symbol] = df
     return result

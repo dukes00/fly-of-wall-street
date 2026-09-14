@@ -133,3 +133,19 @@ def test_conform_drops_out_of_session_and_dedups() -> None:
     assert len(df) == 1
     assert df["timestamp"].dtype == "int64"
     assert df["volume"].dtype == "int64"
+
+
+def test_chunk_window_splits_into_contiguous_seven_day_windows() -> None:
+    from fruitfly.data import _chunk_window
+
+    start = pd.Timestamp(2026, 1, 1, tz="UTC")
+    end = pd.Timestamp(2026, 1, 25, tz="UTC")
+    wins = _chunk_window(start, end)
+    assert all((hi - lo) <= pd.Timedelta(days=7) for lo, hi in wins)
+    assert all(wins[i][1] == wins[i + 1][0] for i in range(len(wins) - 1))
+    assert wins[0][0] == start and wins[-1][1] == end
+    assert (len(wins), (wins[-1][1] - wins[-1][0]).days) == (4, 3)
+    # windows within the Yahoo 1m cap need no splitting
+    assert _chunk_window(start, start + pd.Timedelta(days=6)) == [
+        (start, start + pd.Timedelta(days=6))
+    ]
