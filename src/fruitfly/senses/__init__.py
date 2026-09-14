@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from fruitfly.senses.smell import (
     FEATURE_NEUTRAL,
+    FEATURES,
     build_features,
     encode_smell,
     identity_profile,
@@ -39,6 +40,7 @@ __all__ = [
     "DIRECTION_GAIN",
     "build_features",
     "FEATURE_NEUTRAL",
+    "FEATURES",
     "GRID_H",
     "GRID_W",
     "LOOMING_GAIN",
