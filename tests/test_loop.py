@@ -68,7 +68,7 @@ def make_chassis() -> Chassis:
          for i, (t, p, nt, s), r
          in zip(range(n), _ROWS,
                 ["antennal-lobe"] * 4 + ["mushroom-body"] * 14
-                + ["protocerebrum"] * 4 + ["medulla"] * 4 + ["lobula"] * 8,
+                + ["protocerebrum"] * 4,
                 strict=True)],
         columns=_COLS,
     )
