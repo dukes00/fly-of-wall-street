@@ -10,37 +10,29 @@ the extended IEX cache, against SPX buy-hold over the same days
 
 | arm | chassis | artifact | md5 | trained window | meta |
 |---|---|---|---|---|---|
-| stripped | stripped | data/fly-stripped-hist-weights.npz | — | 2026-03-02..2026-06-30 | **PENDING** — training paused; relaunch after the fill-model fix (no-look-ahead + pessimistic fills), then `FRUITFLY_MARKET_DIR=data/market/history uv run python scripts/eval_brains.py --chassis stripped --artifact data/fly-stripped-hist-weights.npz` |
-| whole | whole | data/fly-whole-weights.npz | — | 2026-03-02..2026-06-30 | **PENDING** — orchestrator fills after the whole-fly artifact lands, then `FRUITFLY_MARKET_DIR=data/market/history uv run python scripts/eval_brains.py --chassis whole --artifact data/fly-whole-weights.npz` |
+| stripped | stripped | `data/fly-stripped-hist-weights.npz` | 99137f6f9bf2… | 2026-03-02..2026-06-30 | seed=7 bars=32611 deaths=0 std=(None,None) |
+| whole | whole | data/fly-whole-weights.npz | — | 2026-03-02..2026-06-30 (whole-fly training in flight) | **PENDING** |
 
 ## Held-out comparison
 
 Per-day: final return % and max drawdown % of the day's backtest
 (each day a fresh fly at $100,000, artifact weights injected, fixed
-seed 7); trades = orders, deaths = fly deaths. TOTAL row: arms
-aggregate mean daily return %, worst-day drawdown %, summed
+seed 7); trades = orders, deaths = fly deaths. TOTAL row:
+arms aggregate mean daily return %, worst-day drawdown %, summed
 trades/deaths; SPX shows the compounded window return % and the
-drawdown % across the held-out days. Missing whole-fly arm = PENDING.
+drawdown % across the held-out days.
+Missing whole-fly arm = PENDING.
 
 | day | SPX ret% | SPX dd% | stripped ret% | stripped dd% | stripped trades | stripped deaths | whole ret% | whole dd% | whole trades | whole deaths |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2026-08-28 | -0.249 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-08-31 | -0.332 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-01 | -0.711 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-02 | 0.460 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-03 | 1.058 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-04 | -0.376 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-08 | -0.584 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-09 | -0.484 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-10 | -0.585 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-11 | 0.860 | — | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| TOTAL | -0.957 | 2.014 | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-
-> **Skeleton note:** the SPX figures above are real (computed via
-> `fruitfly.scoreboard.spx_buyhold` over 2026-08-28..2026-09-11, the 10
-> most recent days of the extended IEX cache); the running
-> `scripts/eval_brains.py` regenerates this whole report
-> deterministically, so do not hand-edit the table. The stripped arm is
-> staged — its training run was killed on 2026-09-15 before the
-> fill-model fix (no-look-ahead + pessimistic fills) landed; both
-> trainings + evals relaunch after that fix.
+| 2026-08-28 | -0.249 | — | -0.237 | 1.215 | 154 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-08-31 | -0.332 | — | 0.088 | 0.433 | 187 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-01 | -0.711 | — | -0.755 | 1.208 | 179 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-02 | 0.460 | — | -0.006 | 0.882 | 177 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-03 | 1.058 | — | 0.564 | 0.670 | 166 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-04 | -0.376 | — | 0.310 | 0.361 | 173 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-08 | -0.584 | — | -0.528 | 0.814 | 158 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-09 | -0.484 | — | -0.176 | 0.441 | 195 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-10 | -0.585 | — | -0.729 | 0.897 | 162 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-09-11 | 0.860 | — | -0.525 | 0.593 | 190 | 0 | PENDING | PENDING | PENDING | PENDING |
+| TOTAL | -0.957 | 2.014 | -0.199 | 1.215 | 1741 | 0 | PENDING | PENDING | PENDING | PENDING |
