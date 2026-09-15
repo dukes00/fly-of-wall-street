@@ -396,7 +396,9 @@ def _replay_std(tag: str, config: BacktestConfig, chassis, beta: float,
     if run_dir.exists():
         shutil.rmtree(run_dir)
 
-    def _std_sim(c, dt_ms, seed):
+    def _std_sim(c, dt_ms, seed, std_beta=None, std_tau_rec_ms=None):
+        # The loop now passes its config's std_* through; the T12b seam pins
+        # the calibrated values this invocation was given (same values).
         return LIFSim(c, dt_ms=dt_ms, seed=seed,
                       std_beta=beta, std_tau_rec_ms=tau)
 

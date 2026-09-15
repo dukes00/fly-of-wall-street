@@ -90,7 +90,7 @@ import numpy as np
 import pandas as pd
 
 from fruitfly.__main__ import register_command
-from fruitfly.connectome import Chassis, load_stripped_chassis
+from fruitfly.connectome import Chassis, load_stripped_chassis, load_whole_fly
 from fruitfly.data import BASKET, load_bars
 from fruitfly.neuromod import NeuromodState, Plasticity
 from fruitfly.senses import (
@@ -106,6 +106,7 @@ from fruitfly.sim import LIFSim
 __all__ = [
     "BacktestConfig",
     "RunResult",
+    "resolve_chassis_fields",
     "run_backtest",
 ]
 
@@ -162,6 +163,13 @@ DEATH_THRESHOLD = -0.50
 DT_MS = 1.0
 INITIAL_CASH = 100_000.0
 
+#: Calibrated short-term-depression parameters for the whole-fly chassis
+#: (T12b sweep, reports/t12b-apl-std.md: beta=0.1, tau_rec=500 ms revives KC
+#: yield to stripped-brain level). These are the DEFAULTS for
+#: ``chassis="whole"`` so a whole-fly run cannot forget them.
+WHOLE_CHASSIS_STD_BETA = 0.1
+WHOLE_CHASSIS_STD_TAU_REC_MS = 500.0
+
 
 # ---------------------------------------------------------------------------
 # Config / result
@@ -198,6 +206,16 @@ class BacktestConfig:
     #: shape-(n_kc, n_mbon) float64 (e.g. ``load_larval_weights`` output).
     #: ``None`` (default) keeps the structural baseline — behavior unchanged.
     initial_weights: np.ndarray | None = None
+    #: Brain chassis: ``"stripped"`` (default, the fast dev/test lane) or
+    #: ``"whole"`` (the full proofread fly, labeled for the loop's
+    #: population-keyed readouts — see ``_load_whole_chassis``).
+    chassis: str = "stripped"
+    #: Opt-in short-term synaptic depression (T12b). ``None`` = off (the
+    #: engine stays bit-identical to the pre-STD one). On ``chassis="whole"``
+    #: an unset parameter defaults to the calibrated T12b values
+    #: (``WHOLE_CHASSIS_STD_BETA`` / ``WHOLE_CHASSIS_STD_TAU_REC_MS``).
+    std_beta: float | None = None
+    std_tau_rec_ms: float | None = None
 
     def __post_init__(self) -> None:
         if self.top_k < 1:
@@ -210,6 +228,12 @@ class BacktestConfig:
             raise ValueError("death_threshold must be in (-1, 0)")
         if self.fees < 0:
             raise ValueError("fees must be non-negative")
+        chassis, std_beta, std_tau_rec_ms = resolve_chassis_fields(
+            self.chassis, self.std_beta, self.std_tau_rec_ms
+        )
+        object.__setattr__(self, "chassis", chassis)
+        object.__setattr__(self, "std_beta", std_beta)
+        object.__setattr__(self, "std_tau_rec_ms", std_tau_rec_ms)
 
 
 @dataclass(frozen=True)
@@ -338,8 +362,59 @@ def _size_fraction(mbon_rate_hz: float) -> float:
 
 
 def _load_chassis() -> Chassis:
-    """Chassis source (test seam: tests monkeypatch this to a tiny fixture)."""
+    """Stripped-chassis source (test seam: tests monkeypatch this to a tiny
+    synthetic fixture)."""
     return load_stripped_chassis()
+
+
+def _load_whole_chassis() -> Chassis:
+    """Whole-fly chassis source (test seam: tests monkeypatch this to a tiny
+    synthetic whole-like fixture).
+
+    Production: the cached whole fly with the stripped chassis's
+    population/region labels transferred onto matched bodyIds — exactly the
+    ``transplant.labeled_chassis`` the T12b replay seam injected. The raw
+    whole-fly cache labels every node ``population="whole"``; the loop's
+    sensory encoders and KC/MBON readouts key off the population column.
+    """
+    from fruitfly.transplant import label_whole_chassis
+
+    return label_whole_chassis(load_whole_fly(), load_stripped_chassis())
+
+
+def _resolve_chassis(config: BacktestConfig) -> Chassis:
+    """Chassis per ``config.chassis``: stripped (default) or whole fly."""
+    if config.chassis == "whole":
+        return _load_whole_chassis()
+    return _load_chassis()
+
+
+def resolve_chassis_fields(
+    chassis: str, std_beta: float | None, std_tau_rec_ms: float | None
+) -> tuple[str, float | None, float | None]:
+    """Validate + normalize the (chassis, STD) config triple.
+
+    Shared by :class:`BacktestConfig` and the adult harness config. The
+    whole-fly chassis gets the calibrated T12b STD defaults
+    (:data:`WHOLE_CHASSIS_STD_BETA` / :data:`WHOLE_CHASSIS_STD_TAU_REC_MS`)
+    for any STD parameter left unset, so a whole-fly run cannot forget them;
+    elsewhere the STD parameters must be given together or not at all (the
+    default: off — the engine stays bit-identical to the pre-STD one).
+    """
+    if chassis not in ("stripped", "whole"):
+        raise ValueError(f"chassis must be 'stripped' or 'whole', got {chassis!r}")
+    if chassis == "whole":
+        if std_beta is None:
+            std_beta = WHOLE_CHASSIS_STD_BETA
+        if std_tau_rec_ms is None:
+            std_tau_rec_ms = WHOLE_CHASSIS_STD_TAU_REC_MS
+    if (std_beta is None) != (std_tau_rec_ms is None):
+        raise ValueError("std_beta and std_tau_rec_ms must be given together")
+    if std_beta is not None and not 0.0 < std_beta < 1.0:
+        raise ValueError("std_beta must be in (0, 1)")
+    if std_tau_rec_ms is not None and std_tau_rec_ms <= 0:
+        raise ValueError("std_tau_rec_ms must be positive")
+    return chassis, std_beta, std_tau_rec_ms
 
 
 def _window(start: str, end: str) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -366,9 +441,15 @@ def _run_dir_name(config: BacktestConfig) -> Path:
 def run_backtest(config: BacktestConfig) -> RunResult:
     """Run the foraging backtest (DESIGN §7) and write equity.csv + events.jsonl."""
     t0 = time.perf_counter()
-    chassis = _load_chassis()
+    chassis = _resolve_chassis(config)
     plasticity = Plasticity(chassis)
-    sim = LIFSim(chassis, dt_ms=config.dt_ms, seed=config.seed)
+    sim = LIFSim(
+        chassis,
+        dt_ms=config.dt_ms,
+        seed=config.seed,
+        std_beta=config.std_beta,
+        std_tau_rec_ms=config.std_tau_rec_ms,
+    )
     if config.initial_weights is not None:
         restored = np.asarray(config.initial_weights, dtype=np.float64)
         if restored.shape != plasticity.weights.shape:
@@ -754,6 +835,19 @@ def _register() -> None:
         )
         p.add_argument("--fees", type=float, default=0.0, help="Proportional per-side fee.")
         p.add_argument("--out-dir", default=None, help="Override the artifact directory.")
+        p.add_argument(
+            "--chassis", choices=("stripped", "whole"), default="stripped",
+            help="Brain chassis; 'whole' implies the calibrated T12b STD "
+            "(beta=0.1, tau_rec=500 ms) unless overridden.",
+        )
+        p.add_argument(
+            "--std-beta", type=float, default=None,
+            help="Short-term-depression depletion fraction (whole-fly default 0.1).",
+        )
+        p.add_argument(
+            "--std-tau-rec-ms", type=float, default=None,
+            help="STD recovery time constant in ms (whole-fly default 500).",
+        )
         p.set_defaults(func=_cmd_backtest)
 
     register_command("backtest", builder)
@@ -770,6 +864,9 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         death_threshold=args.death_threshold,
         fees=args.fees,
         out_dir=args.out_dir,
+        chassis=args.chassis,
+        std_beta=args.std_beta,
+        std_tau_rec_ms=args.std_tau_rec_ms,
     )
     result = run_backtest(config)
     print(

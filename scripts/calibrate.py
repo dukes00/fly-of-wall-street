@@ -90,6 +90,9 @@ def run_cell(
     position_cap: int,
     death_threshold: float,
     granularity: str,
+    chassis: str = "stripped",
+    std_beta: float | None = None,
+    std_tau_rec_ms: float | None = None,
     *,
     seed: int = SWEEP_SEED,
     start: str = SWEEP_START,
@@ -114,6 +117,9 @@ def run_cell(
         end=end,
         position_cap=position_cap,
         death_threshold=death_threshold,
+        chassis=chassis,
+        std_beta=std_beta,
+        std_tau_rec_ms=std_tau_rec_ms,
         out_dir=run_dir,
     )
     t0 = time.perf_counter()
@@ -131,6 +137,7 @@ def run_cell(
         "seed": seed,
         "start": start,
         "end": end,
+        "chassis": chassis,
         "final_return_pct": (result.final_equity / config.initial_cash - 1.0) * 100.0,
         "max_drawdown_pct": max_drawdown_pct,
         "n_deaths": result.n_deaths,
@@ -155,8 +162,9 @@ def _cell_worker(args: tuple) -> dict:
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
+    chassis_args = (args.chassis, args.std_beta, args.std_tau_rec_ms)
     cells = [
-        (cap, dth, gran)
+        (cap, dth, gran) + chassis_args
         for gran in ("1min", "2min", "5min")
         for dth in DEATH_THRESHOLDS
         for cap in POSITION_CAPS
@@ -165,6 +173,10 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         cells = [c for c in cells if args.only in f"cap{c[0]}_death{c[1]:+.2f}_{c[2]}"]
     print(f"T9 sweep: {len(cells)} cells, window {SWEEP_START}..{SWEEP_END}, "
           f"seed {SWEEP_SEED}, jobs {args.jobs}")
+    print(f"  chassis {args.chassis}"
+          + (f" std_beta={args.std_beta}" if args.std_beta is not None else "")
+          + (f" std_tau_rec_ms={args.std_tau_rec_ms}"
+             if args.std_tau_rec_ms is not None else ""))
     t0 = time.perf_counter()
     if args.jobs > 1:
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
@@ -199,7 +211,9 @@ def cmd_train(args: argparse.Namespace) -> int:
     from fruitfly.loop import BacktestConfig
     from fruitfly.train import train_larval
 
-    config = BacktestConfig(seed=args.seed, start=args.start, end=args.end)
+    config = BacktestConfig(seed=args.seed, start=args.start, end=args.end,
+                            chassis=args.chassis, std_beta=args.std_beta,
+                            std_tau_rec_ms=args.std_tau_rec_ms)
     print(f"T9 larval training: seed {args.seed} {args.start}..{args.end} -> {args.out}")
     train = train_larval(config, out_path=Path(args.out))
     r = train.run
@@ -219,11 +233,14 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    from fruitfly.connectome import load_stripped_chassis
+    from fruitfly.connectome import load_stripped_chassis, load_whole_fly
     from fruitfly.loop import BacktestConfig, run_backtest
     from fruitfly.train import decision_map, load_larval_weights
 
-    chassis = load_stripped_chassis()
+    if args.chassis == "whole":
+        chassis = load_whole_fly()
+    else:
+        chassis = load_stripped_chassis()
     lw = load_larval_weights(args.weights, chassis)
     meta = {k: lw.meta.get(k, "?") for k in ("seed", "start", "end")}
     print(f"probe day {args.day}, seed {args.seed}")
@@ -232,9 +249,13 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
     tag = Path(args.weights).stem
     fresh_cfg = BacktestConfig(seed=args.seed, start=args.day, end=args.day,
+                               chassis=args.chassis, std_beta=args.std_beta,
+                               std_tau_rec_ms=args.std_tau_rec_ms,
                                out_dir=OUT_DIR / "probe" / tag / "fresh")
     trained_cfg = BacktestConfig(seed=args.seed, start=args.day, end=args.day,
                                  initial_weights=lw.weights,
+                                 chassis=args.chassis, std_beta=args.std_beta,
+                                 std_tau_rec_ms=args.std_tau_rec_ms,
                                  out_dir=OUT_DIR / "probe" / tag / "larval")
     fresh = run_backtest(fresh_cfg)
     trained = run_backtest(trained_cfg)
@@ -291,6 +312,24 @@ def cmd_probe(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+
+def _add_chassis_args(p: argparse.ArgumentParser) -> None:
+    """Shared --chassis / --std-* flags (sweep, train, probe)."""
+    p.add_argument(
+        "--chassis", choices=("stripped", "whole"), default="stripped",
+        help="Brain chassis; 'whole' implies the calibrated T12b STD "
+        "(beta=0.1, tau_rec=500 ms) unless overridden.",
+    )
+    p.add_argument(
+        "--std-beta", type=float, default=None,
+        help="STD depletion fraction (whole-fly default 0.1).",
+    )
+    p.add_argument(
+        "--std-tau-rec-ms", type=float, default=None,
+        help="STD recovery time constant in ms (whole-fly default 500).",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -300,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--only", default=None,
                    help="Substring filter on cell names (e.g. 'cap6', '5min').")
     p.set_defaults(func=cmd_sweep)
+    _add_chassis_args(p)
 
     p = sub.add_parser("train", help="Full-window larval training run.")
     p.add_argument("--start", required=True)
@@ -307,12 +347,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--out", default="data/fly-larval-weights.npz")
     p.set_defaults(func=cmd_train)
+    _add_chassis_args(p)
 
     p = sub.add_parser("probe", help="Fresh vs larval-weights decision comparison.")
     p.add_argument("--day", required=True, help="Probe day (YYYY-MM-DD).")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--weights", default="data/fly-larval-weights.npz")
     p.set_defaults(func=cmd_probe)
+    _add_chassis_args(p)
 
     args = parser.parse_args(argv)
     return args.func(args)

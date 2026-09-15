@@ -68,6 +68,11 @@ TRAIN_SEED = 7
 #: Fixed zip member timestamp for deterministic archives (zip's floor).
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
+#: Artifact ``chassis`` meta label -> the Chassis ``meta["kind"]`` it must
+#: match at load time (the fingerprint guard cannot distinguish two chassis
+#: built on identical graphs; the label can).
+_CHASSIS_KINDS = {"stripped": "stripped-chassis", "whole": "whole-fly"}
+
 
 # ---------------------------------------------------------------------------
 # Chassis fingerprint
@@ -154,8 +159,13 @@ def load_larval_weights(
     """Load the larval artifact; optionally verify it against ``chassis``.
 
     With ``chassis`` given (and ``verify``), a fingerprint mismatch raises —
-    an artifact trained on a different brain must never be injected. Pass
-    ``verify=False`` to inspect a foreign artifact without a chassis.
+    an artifact trained on a different brain must never be injected — and so
+    does a chassis-kind mismatch between the artifact's ``chassis`` meta
+    label and the runtime chassis's ``meta["kind"]`` (fingerprints cannot
+    distinguish two chassis built on identical graphs; labels can). Legacy
+    artifacts without the label and chassis fixtures without a kind are
+    checked by fingerprint only. Pass ``verify=False`` to inspect a foreign
+    artifact without a chassis.
     """
     with np.load(path, allow_pickle=False) as z:
         weights = np.asarray(z["weights"], dtype=np.float64)
@@ -168,6 +178,17 @@ def load_larval_weights(
             raise ValueError(
                 "larval artifact was trained on a different chassis "
                 f"(artifact {fingerprint[:12]}… != current {actual[:12]}…)"
+            )
+        artifact_chassis = meta.get("chassis")
+        kind = chassis.meta.get("kind")
+        if (
+            artifact_chassis is not None
+            and kind is not None
+            and _CHASSIS_KINDS.get(artifact_chassis, artifact_chassis) != kind
+        ):
+            raise ValueError(
+                "larval artifact was trained on a different chassis kind "
+                f"(artifact chassis {artifact_chassis!r} != current {kind!r})"
             )
     return LarvalWeights(weights=weights, fingerprint=fingerprint, meta=meta)
 
@@ -202,7 +223,7 @@ def train_larval(
     result = _loop.run_backtest(config)
     if result.final_weights is None:  # pragma: no cover - defensive
         raise RuntimeError("run_backtest returned no final weights")
-    chassis = _loop._load_chassis()
+    chassis = _loop._resolve_chassis(config)
     fingerprint = chassis_fingerprint(chassis)
     meta = {
         "seed": str(config.seed),
@@ -213,6 +234,9 @@ def train_larval(
         "final_equity": f"{result.final_equity:.2f}",
         "n_bars": str(result.n_bars),
         "n_deaths": str(result.n_deaths),
+        "chassis": config.chassis,
+        "std_beta": str(config.std_beta),
+        "std_tau_rec_ms": str(config.std_tau_rec_ms),
     }
     artifact = save_larval_weights(out_path, result.final_weights, fingerprint, meta)
     return TrainResult(

@@ -294,3 +294,69 @@ class TestDeathHatch:
         # wake after the death hatch: the hatched fly keeps encountering
         assert types.count("encounter") > 5
 
+
+
+# ---------------------------------------------------------------------------
+# Chassis config (whole-fly phase 1): artifact meta + chassis-kind guard
+# ---------------------------------------------------------------------------
+
+
+def _whole_like_chassis():
+    """The synthetic fixture relabeled as a whole-fly chassis."""
+    import dataclasses
+
+    return dataclasses.replace(make_chassis(), meta={"kind": "whole-fly"})
+
+
+class TestChassisArtifact:
+    def test_train_larval_records_chassis_and_std(self, patched, monkeypatch, tmp_path):
+        loop = patched
+        monkeypatch.setattr(loop, "_load_whole_chassis", make_chassis)
+        train = train_larval(
+            _config(tmp_path / "run", chassis="whole"),
+            out_path=tmp_path / "whole.npz",
+        )
+        assert train.meta["chassis"] == "whole"
+        # The calibrated T12b STD defaults are recorded, not the raw Nones.
+        assert train.meta["std_beta"] == "0.1"
+        assert train.meta["std_tau_rec_ms"] == "500.0"
+        lw = load_larval_weights(tmp_path / "whole.npz")
+        assert lw.meta["chassis"] == "whole"
+
+    def test_stripped_default_meta_is_backward_visible(self, patched, tmp_path):
+        train = train_larval(
+            _config(tmp_path / "run"), out_path=tmp_path / "stripped.npz"
+        )
+        assert train.meta["chassis"] == "stripped"
+        assert train.meta["std_beta"] == "None"
+        assert train.meta["std_tau_rec_ms"] == "None"
+
+    def test_chassis_kind_guard_rejects_mismatch(self, patched, tmp_path):
+        train_larval(_config(tmp_path / "run"), out_path=tmp_path / "larval.npz")
+        # Same graph (fingerprint matches) but labeled a different chassis
+        # kind: the label guard must refuse what the fingerprint cannot see.
+        with pytest.raises(ValueError, match="different chassis kind"):
+            load_larval_weights(tmp_path / "larval.npz", _whole_like_chassis())
+
+    def test_chassis_kind_guard_accepts_match(self, patched, monkeypatch, tmp_path):
+        loop = patched
+        monkeypatch.setattr(loop, "_load_whole_chassis", make_chassis)
+        train_larval(
+            _config(tmp_path / "run", chassis="whole"),
+            out_path=tmp_path / "whole.npz",
+        )
+        lw = load_larval_weights(tmp_path / "whole.npz", _whole_like_chassis())
+        assert lw.meta["chassis"] == "whole"
+
+    def test_legacy_artifact_without_chassis_label_still_loads(self, patched, tmp_path):
+        import fruitfly.train as train_mod
+
+        train_larval(_config(tmp_path / "run"), out_path=tmp_path / "larval.npz")
+        # Simulate a pre-phase-1 artifact: no chassis label in the meta.
+        lw = load_larval_weights(tmp_path / "larval.npz")
+        meta = {k: v for k, v in lw.meta.items() if k != "chassis"}
+        train_mod.save_larval_weights(
+            tmp_path / "legacy.npz", lw.weights, lw.fingerprint, meta
+        )
+        lw2 = load_larval_weights(tmp_path / "legacy.npz", make_chassis())
+        assert "chassis" not in lw2.meta

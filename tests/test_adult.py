@@ -532,3 +532,37 @@ class TestLiveSeam:
         # Just before the open: today's open.
         pre_open = pd.Timestamp("2026-09-16 13:00:00", tz="UTC")
         assert next_session_open(pre_open) == pd.Timestamp("2026-09-16 13:30:00", tz="UTC")
+
+
+# ---------------------------------------------------------------------------
+# Chassis config (whole-fly phase 1): pass-through to the loop config
+# ---------------------------------------------------------------------------
+
+
+class TestChassisPassThrough:
+    def test_whole_config_gets_calibrated_std_and_passes_through(self):
+        cfg = _config(Path("data/adult/unused"), chassis="whole")
+        # The calibrated T12b defaults are applied at construction.
+        assert cfg.std_beta == 0.1
+        assert cfg.std_tau_rec_ms == 500.0
+        bt = cfg.backtest_config()
+        assert bt.chassis == "whole"
+        assert bt.std_beta == 0.1
+        assert bt.std_tau_rec_ms == 500.0
+        # Resume parity: the state-file echo pins the constitution.
+        echo = cfg._echo()
+        assert echo["chassis"] == "whole"
+        assert echo["std_beta"] == 0.1
+        assert echo["std_tau_rec_ms"] == 500.0
+
+    def test_default_is_stripped_without_std(self):
+        cfg = _config(Path("data/adult/unused"))
+        assert cfg.chassis == "stripped"
+        assert cfg.std_beta is None and cfg.std_tau_rec_ms is None
+        bt = cfg.backtest_config()
+        assert bt.chassis == "stripped"
+        assert bt.std_beta is None and bt.std_tau_rec_ms is None
+
+    def test_unknown_chassis_rejected(self):
+        with pytest.raises(ValueError, match="chassis must be"):
+            _config(Path("data/adult/unused"), chassis="larval")

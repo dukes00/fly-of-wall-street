@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -247,3 +248,114 @@ class TestDeath:
             row.split(",") for row in rows if row.startswith(death["ts"])
         )
         assert int(death_row[3]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Chassis config (whole-fly phase 1): validation + sim construction
+# ---------------------------------------------------------------------------
+
+
+class TestChassisConfig:
+    """``BacktestConfig`` chassis/STD surface (defaults must not move)."""
+
+    def test_default_is_stripped_without_std(self):
+        cfg = BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18")
+        assert cfg.chassis == "stripped"
+        assert cfg.std_beta is None
+        assert cfg.std_tau_rec_ms is None
+
+    def test_whole_chassis_gets_calibrated_std_defaults(self):
+        cfg = BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
+                             chassis="whole")
+        # The calibrated T12b point (reports/t12b-apl-std.md) is mandatory.
+        assert cfg.std_beta == 0.1
+        assert cfg.std_tau_rec_ms == 500.0
+
+    def test_whole_chassis_honors_explicit_std(self):
+        cfg = BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
+                             chassis="whole", std_beta=0.3, std_tau_rec_ms=200.0)
+        assert cfg.std_beta == 0.3
+        assert cfg.std_tau_rec_ms == 200.0
+
+    def test_unknown_chassis_rejected(self):
+        with pytest.raises(ValueError, match="chassis must be"):
+            BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
+                           chassis="larval")
+
+    def test_partial_std_on_stripped_rejected(self):
+        with pytest.raises(ValueError, match="together"):
+            BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
+                           std_beta=0.1)
+
+    def test_std_ranges_validated(self):
+        with pytest.raises(ValueError, match="std_beta"):
+            BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
+                           chassis="whole", std_beta=1.5)
+        with pytest.raises(ValueError, match="std_tau_rec_ms"):
+            BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
+                           chassis="whole", std_tau_rec_ms=-1.0)
+
+
+class TestChassisSimConstruction:
+    """The loop builds the engine the config asks for (real code path)."""
+
+    def test_default_run_builds_std_off_sim(self, patched, monkeypatch, tmp_path):
+        import fruitfly.loop as loop
+
+        seen: dict = {}
+        real = loop.LIFSim
+
+        def spy(chassis, **kwargs):
+            seen.update(kwargs)
+            return real(chassis, **kwargs)
+
+        monkeypatch.setattr(loop, "LIFSim", spy)
+        run_backtest(_config(7, tmp_path / "run"))
+        # STD off by default: the engine stays bit-identical to the pre-STD one.
+        assert seen["std_beta"] is None
+        assert seen["std_tau_rec_ms"] is None
+
+    def test_whole_config_routes_whole_seam_and_calibrated_std(
+        self, patched, monkeypatch, tmp_path
+    ):
+        import fruitfly.loop as loop
+
+        chassis = make_chassis()
+        seen: dict = {}
+        real = loop.LIFSim
+
+        def spy(sim_chassis, **kwargs):
+            seen["chassis"] = sim_chassis
+            seen.update(kwargs)
+            return real(sim_chassis, **kwargs)
+
+        monkeypatch.setattr(loop, "_load_whole_chassis", lambda: chassis)
+        monkeypatch.setattr(loop, "LIFSim", spy)
+        result = run_backtest(_config(7, tmp_path / "run", chassis="whole"))
+        assert seen["chassis"] is chassis
+        # Callers cannot forget the calibrated T12b STD parameters.
+        assert seen["std_beta"] == 0.1
+        assert seen["std_tau_rec_ms"] == 500.0
+        assert result.n_bars > 0
+
+    def test_whole_run_is_deterministic(self, patched, monkeypatch, tmp_path):
+        import fruitfly.loop as loop
+
+        monkeypatch.setattr(loop, "_load_whole_chassis", make_chassis)
+        a = run_backtest(_config(7, tmp_path / "a", chassis="whole"))
+        b = run_backtest(_config(7, tmp_path / "b", chassis="whole"))
+        for name in ("equity.csv", "events.jsonl"):
+            assert _sha(a.run_dir / name) == _sha(b.run_dir / name)
+
+
+@pytest.mark.skipif(
+    os.environ.get("FRUITFLY_WHOLE_SMOKE") != "1",
+    reason="real whole-fly smoke (~8 min + 781 MB cache): set FRUITFLY_WHOLE_SMOKE=1",
+)
+def test_whole_fly_real_smoke(tmp_path):
+    """One real single-day whole-fly backtest through the config path."""
+    result = run_backtest(
+        BacktestConfig(seed=7, start="2026-08-18", end="2026-08-18",
+                       chassis="whole", out_dir=tmp_path / "smoke")
+    )
+    assert result.n_bars > 0

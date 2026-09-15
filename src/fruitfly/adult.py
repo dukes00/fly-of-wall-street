@@ -94,6 +94,7 @@ from fruitfly.loop import (
     _Position,
     _size_fraction,
     _window,
+    resolve_chassis_fields,
 )
 from fruitfly.neuromod import NeuromodState, Plasticity
 from fruitfly.senses import encode_smell, encode_taste, encode_vision
@@ -160,6 +161,11 @@ class AdultConfig:
     avoid_thr: float = AVOID_THR
     noise_sigma_mv: float = NOISE_SIGMA_MV
     dt_ms: float = DT_MS
+    #: Brain chassis + opt-in STD (mirror of ``loop.BacktestConfig``; the
+    #: whole-fly chassis defaults to the calibrated T12b STD parameters).
+    chassis: str = "stripped"
+    std_beta: float | None = None
+    std_tau_rec_ms: float | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("replay", "live-paper"):
@@ -176,6 +182,12 @@ class AdultConfig:
             raise ValueError("death_threshold must be in (-1, 0)")
         if self.fees < 0:
             raise ValueError("fees must be non-negative")
+        chassis, std_beta, std_tau_rec_ms = resolve_chassis_fields(
+            self.chassis, self.std_beta, self.std_tau_rec_ms
+        )
+        object.__setattr__(self, "chassis", chassis)
+        object.__setattr__(self, "std_beta", std_beta)
+        object.__setattr__(self, "std_tau_rec_ms", std_tau_rec_ms)
 
     def backtest_config(self, out_dir: str | Path | None = None) -> BacktestConfig:
         """The equivalent larval :class:`BacktestConfig` (parity reference)."""
@@ -195,6 +207,9 @@ class AdultConfig:
             avoid_thr=self.avoid_thr,
             noise_sigma_mv=self.noise_sigma_mv,
             dt_ms=self.dt_ms,
+            chassis=self.chassis,
+            std_beta=self.std_beta,
+            std_tau_rec_ms=self.std_tau_rec_ms,
             out_dir=out_dir,
         )
 
@@ -223,6 +238,9 @@ class AdultConfig:
             "avoid_thr": self.avoid_thr,
             "noise_sigma_mv": self.noise_sigma_mv,
             "dt_ms": self.dt_ms,
+            "chassis": self.chassis,
+            "std_beta": self.std_beta,
+            "std_tau_rec_ms": self.std_tau_rec_ms,
         }
 
 
@@ -641,7 +659,7 @@ class AdultRun:
     def run(self) -> AdultResult:
         t0 = time.perf_counter()
         cfg = self._cfg
-        chassis = _load_chassis()
+        chassis = _resolve_chassis(cfg)
         self._chassis = chassis
         fingerprint = chassis_fingerprint(chassis)
 
@@ -696,7 +714,13 @@ class AdultRun:
 
         # --- brain (fresh build, then state restore on resume) --------------
         plasticity = Plasticity(chassis)
-        sim = LIFSim(chassis, dt_ms=cfg.dt_ms, seed=cfg.seed)
+        sim = LIFSim(
+            chassis,
+            dt_ms=cfg.dt_ms,
+            seed=cfg.seed,
+            std_beta=cfg.std_beta,
+            std_tau_rec_ms=cfg.std_tau_rec_ms,
+        )
         if resumed:
             plasticity.weights[...] = st.weights
             plasticity.eligibility[...] = st.eligibility
@@ -1087,10 +1111,34 @@ class AdultRun:
 
 
 def _load_chassis():
-    """Chassis source (test seam: tests monkeypatch this to a tiny fixture)."""
+    """Stripped-chassis source (test seam: tests monkeypatch this to a tiny
+    synthetic fixture)."""
     from fruitfly.connectome import load_stripped_chassis
 
     return load_stripped_chassis()
+
+
+def _load_whole_chassis():
+    """Whole-fly chassis source (test seam: tests monkeypatch this to a tiny
+    synthetic whole-like fixture).
+
+    Production: the cached whole fly with the stripped chassis's
+    population/region labels transferred onto matched bodyIds — exactly the
+    ``transplant.labeled_chassis`` the T12b replay seam injected (the raw
+    whole-fly cache labels every node ``population="whole"``, which the
+    loop's population-keyed readouts cannot see).
+    """
+    from fruitfly.connectome import load_stripped_chassis, load_whole_fly
+    from fruitfly.transplant import label_whole_chassis
+
+    return label_whole_chassis(load_whole_fly(), load_stripped_chassis())
+
+
+def _resolve_chassis(config: AdultConfig):
+    """Chassis per ``config.chassis``: stripped (default) or whole fly."""
+    if config.chassis == "whole":
+        return _load_whole_chassis()
+    return _load_chassis()
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1165,12 @@ def _register() -> None:
         p.add_argument("--end", required=True, help="e.g. 2026-09-14")
         p.add_argument("--mode", choices=("replay", "live-paper"), default="replay")
         p.add_argument("--run-dir", default=None)
+        p.add_argument(
+            "--chassis", choices=("stripped", "whole"), default="stripped",
+            help="Brain chassis; 'whole' implies the calibrated T12b STD.",
+        )
+        p.add_argument("--std-beta", type=float, default=None)
+        p.add_argument("--std-tau-rec-ms", type=float, default=None)
         p.add_argument("--persist-every", type=int, default=1)
         p.add_argument("--larval-weights", default=None, help="T9 .npz artifact path")
         p.set_defaults(func=_cmd_adult)
@@ -1133,6 +1187,9 @@ def _cmd_adult(args: argparse.Namespace) -> int:
         run_dir=args.run_dir,
         persist_every=args.persist_every,
         larval_weights=args.larval_weights,
+        chassis=args.chassis,
+        std_beta=args.std_beta,
+        std_tau_rec_ms=args.std_tau_rec_ms,
     )
     result = AdultRun(config).run()
     resumed = " (resumed)" if result.resumed else ""
