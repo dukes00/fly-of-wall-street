@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     import fruitfly.dashboard  # noqa: F401  # registers the dashboard command
     import fruitfly.data  # noqa: F401  # registers the fetch-data command
     import fruitfly.loop  # noqa: F401  # registers the backtest command
+    import fruitfly.postmortem  # noqa: F401  # registers the postmortem command
 
     parser = argparse.ArgumentParser(
         prog="python -m fruitfly",
