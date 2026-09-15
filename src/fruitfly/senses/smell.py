@@ -7,13 +7,15 @@ Two components (DESIGN §3, D5):
   the ticker string ("AAPL smells like AAPL"): constant per ticker for the
   ticker's lifetime, pairwise-distinct across tickers. Profile values are
   uniform in [0, 1).
-- **State** — market features (returns, RSI, volatility, volume_delta) scale
-  the identity multiplicatively, per glomerulus. Each (feature, channel) pair
+- **State** — market features (returns, RSI, volatility, volume_delta,
+  mom20, slope20) scale the identity multiplicatively, per glomerulus. Each
+  (feature, channel) pair
   has a BLAKE2b-derived weight in [-0.25, 0.25]; the per-channel modulator is
-  the product of ``(1 + w * s)`` over the four features, where each feature is
+  the product of ``(1 + w * s)`` over the six features, where each feature is
   squashed to [-1, 1] first (tanh after a documented linear scale: returns
-  x10, RSI centered at 50 over +/-25, volatility x25, volume_delta x2). A
-  missing feature is treated as 0.0 (neutral). With all-neutral features the
+  x10, RSI centered at 50 over +/-25, volatility x25, volume_delta x2,
+  mom20 x10, slope20 x200).
+  A missing feature is treated as 0.0 (neutral). With all-neutral features the
   modulator is exactly 1 and the output *is* the identity signature.
 
 Glomeruli -> uPNs: each uPN node in the chassis carries its glomerulus in its
@@ -26,7 +28,7 @@ raises — the mapping is data, not a choice made at encode time.
 
 Output: float64 array of 391 dims, aligned to the uPN nodes **in chassis node
 order** (``chassis.nodes[population == "uPN"]``). Nonnegative (identity >= 0,
-modulator >= 0.75**4 > 0). Pure and deterministic.
+modulator >= 0.75**6 > 0). Pure and deterministic.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ from fruitfly.senses._hash import _MASK64, stable_u64, stable_uniform
 _GLOM_RE = re.compile(r"_(adPN|lPN|vPN|lvPN)\d*$")
 
 #: Fixed feature order (iteration order everywhere — never dict order).
-FEATURES = ("returns", "rsi", "volatility", "volume_delta")
+FEATURES = ("returns", "rsi", "volatility", "volume_delta", "mom20", "slope20")
 
 #: Linear pre-scale per feature before the tanh squash to [-1, 1].
 FEATURE_SCALE = {
@@ -51,13 +53,22 @@ FEATURE_SCALE = {
     "rsi": 1.0 / 25.0,  # (rsi - 50) / 25: RSI 75 -> +1
     "volatility": 25.0,  # 4% realized vol saturates
     "volume_delta": 2.0,  # 50% relative volume change saturates
+    "mom20": 10.0,  # 20-bar momentum: a 20% 20-bar move ~ tanh(2)
+    "slope20": 200.0,  # relative OLS slope: 0.5%/bar saturates
 }
 
 #: Weight range per (feature, glomerulus) modulator term.
 _MOD_WEIGHT = 0.25
 
 #: Neutral (identity-preserving) value per feature when a key is missing.
-FEATURE_NEUTRAL = {"returns": 0.0, "rsi": 50.0, "volatility": 0.0, "volume_delta": 0.0}
+FEATURE_NEUTRAL = {
+    "returns": 0.0,
+    "rsi": 50.0,
+    "volatility": 0.0,
+    "volume_delta": 0.0,
+    "mom20": 0.0,
+    "slope20": 0.0,
+}
 
 #: Number of glomerular channels (matches chassis.meta["glomeruli"]).
 _N_CHANNELS = 88
@@ -75,7 +86,7 @@ def build_features(
     rsi_period: int = RSI_PERIOD,
     vol_window: int = VOL_WINDOW,
 ) -> dict[str, float]:
-    """Compute the four state features (``FEATURES``) from OHLCV bars.
+    """Compute the state features (``FEATURES``) from OHLCV bars.
 
     This is THE shared feature builder: the smell channel's modulation
     inputs and the T8 logistic control (``scoreboard.logistic_control``)
@@ -91,6 +102,11 @@ def build_features(
       simple close-to-close returns.
     - ``volume_delta``: last bar's volume relative to the mean volume of
       the preceding ``vol_window`` bars: ``volume[-1] / mean - 1``.
+    - ``mom20``: 20-bar momentum ``close[-1] / close[-21] - 1`` (trailing
+      only; neutral below 21 bars).
+    - ``slope20``: OLS slope per bar of ``close`` over the last 20 bars,
+      divided by the mean close of the window (a relative, scale-free
+      slope; trailing only; neutral below 20 bars).
 
     When the frame has too few rows for a feature, that feature takes its
     neutral value (``FEATURE_NEUTRAL``) — the same convention
@@ -117,6 +133,12 @@ def build_features(
         base = float(volume[-(vol_window + 1):-1].mean())
         if base > 0.0:
             out["volume_delta"] = float(volume[-1] / base - 1.0)
+    if len(close) >= 21:
+        out["mom20"] = float(close[-1] / close[-21] - 1.0)
+    if len(close) >= 20:
+        window = close[-20:]
+        slope = float(np.polyfit(np.arange(20), window, 1)[0])
+        out["slope20"] = slope / float(window.mean())
     return out
 
 
@@ -167,9 +189,10 @@ def encode_smell(ticker: str, features: dict, chassis) -> np.ndarray:
 
     ``features`` maps (a subset of) ``FEATURES`` to floats — returns as a
     fraction, RSI on the 0-100 scale, volatility as a std-dev fraction,
-    volume_delta as a relative change. A missing key takes its neutral value
-    (``FEATURE_NEUTRAL``: 0.0 for returns/volatility/volume_delta, 50.0 for
-    RSI) and leaves the identity signature untouched.
+    volume_delta as a relative change, mom20/slope20 as defined in
+    :func:`build_features`. A missing key takes its neutral value
+    (``FEATURE_NEUTRAL``: 0.0 for returns/volatility/volume_delta/mom20/
+    slope20, 50.0 for RSI) and leaves the identity signature untouched.
     Returns float64, shape (n_uPN,) = (391,), aligned to uPN nodes in chassis
     order. Pure and deterministic.
     """

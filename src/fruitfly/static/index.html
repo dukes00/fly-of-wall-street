@@ -1,314 +1,281 @@
-<!DOCTYPE html>
+<!doctype html>
+<!-- T14 live dashboard (D21: one static page, vanilla JS + canvas, no
+     build step, nothing loaded off-machine). Rendered from /api/state
+     snapshots pushed over SSE. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fruit Fly of Wall Street — live dashboard</title>
 <style>
-  :root {
-    --bg: #101418; --panel: #171d24; --edge: #26303a;
-    --text: #d7e0e8; --dim: #7f8f9d;
-    --green: #4ade80; --red: #f87171; --amber: #fbbf24; --blue: #60a5fa;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  header {
-    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
-    padding: 10px 16px; border-bottom: 1px solid var(--edge);
-  }
-  header h1 { font-size: 14px; margin: 0; letter-spacing: 0.5px; }
-  header .meta { color: var(--dim); }
-  #status.live { color: var(--green); }
-  #status.waiting { color: var(--amber); }
-  main {
-    display: grid; gap: 12px; padding: 12px 16px;
-    grid-template-columns: 2fr 1fr;
-    grid-template-areas: "equity mbon" "neuron mbon" "events events";
-  }
-  section {
-    background: var(--panel); border: 1px solid var(--edge);
-    border-radius: 6px; padding: 10px 12px; min-width: 0;
-  }
-  section h2 {
-    margin: 0 0 8px; font-size: 11px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 1px; color: var(--dim);
-  }
-  #panel-equity { grid-area: equity; }
-  #panel-neuron { grid-area: neuron; }
-  main {
-    display: grid; gap: 12px; padding: 12px 16px;
-    grid-template-columns: 2fr 1fr;
-    grid-template-areas: "equity mbon" "neuron positions" "events events";
-  }
-  td.num, th.num { text-align: right; }
-  .big { font-size: 26px; font-weight: 700; }
-  #panel-positions { grid-area: positions; }
-  .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
-  .row .k { color: var(--dim); }
-  .pos { color: var(--green); }
-  .neg { color: var(--red); }
-  #eventlog {
-    margin: 0; padding: 0; list-style: none; max-height: 260px; overflow-y: auto;
-    white-space: nowrap;
-  }
-  #eventlog li { padding: 1px 0; border-bottom: 1px dashed #1d252e; overflow: hidden; text-overflow: ellipsis; }
-  #eventlog .t { color: var(--blue); display: inline-block; min-width: 8.5em; }
-  #eventlog .ts { color: var(--dim); display: inline-block; min-width: 15em; }
-  #conn { color: var(--dim); font-size: 11px; }
+  :root { color-scheme: dark; }
+  body { font: 14px/1.45 ui-monospace, Menlo, monospace; margin: 0;
+         background: #101418; color: #d8e0e8; }
+  header { padding: 12px 18px; border-bottom: 1px solid #2a3440;
+           display: flex; gap: 24px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  .kv { color: #8fa3b5; } .kv b { color: #e8f0f8; }
+  .waiting { color: #e0a040; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px; }
+  section { border: 1px solid #2a3440; border-radius: 8px; padding: 10px 12px;
+            background: #151b22; min-width: 0; }
+  section.wide { grid-column: 1 / -1; }
+  h2 { font-size: 13px; margin: 0 0 8px; color: #7ec8e3; letter-spacing: .06em;
+       text-transform: uppercase; }
+  canvas { width: 100%; height: 200px; display: block; background: #0c1014;
+           border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: right; padding: 2px 8px; border-bottom: 1px solid #222c36; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: #8fa3b5; font-weight: normal; }
+  .pos { color: #7ad48a; } .neg { color: #e88; }
+  .dash { color: #5a6a78; }
+  #events { max-height: 240px; overflow-y: auto; font-size: 12px; }
+  .ev { padding: 1px 0; border-bottom: 1px dotted #222c36; white-space: pre-wrap; }
+  .ev .type { color: #7ec8e3; }
+  #status.waiting::after { content: " — waiting for receipts"; color: #e0a040; }
 </style>
 </head>
 <body>
 <header>
-  <h1>FRUIT FLY OF WALL STREET</h1>
-  <span id="status" class="waiting">connecting…</span>
-  <span class="meta" id="rundir"></span>
-  <span class="meta" id="latest"></span>
-  <span class="meta" id="conn"></span>
+  <h1>fruit fly of wall street</h1>
+  <span class="kv" id="status">connecting</span>
+  <span class="kv">equity <b id="h-equity">—</b></span>
+  <span class="kv">cash <b id="h-cash">—</b></span>
+  <span class="kv">hatch <b id="h-hatch">—</b></span>
+  <span class="kv">deaths <b id="h-deaths">—</b></span>
+  <span class="kv">bars <b id="h-bars">—</b></span>
+  <span class="kv">last <b id="h-ts">—</b></span>
 </header>
 <main>
-  <section id="panel-equity">
-    <h2>Equity</h2>
-    <canvas id="equity-canvas"></canvas>
+  <section class="wide" id="panel-equity">
+    <h2>Equity &amp; drawdown</h2>
+    <canvas id="c-equity"></canvas>
   </section>
-  <section id="panel-mbon">
-    <h2>MBON balance</h2>
-    <div class="big" id="mbon-balance">—</div>
-    <div class="row"><span class="k">raw balance</span><span id="mbon-raw">—</span></div>
-    <div class="row"><span class="k">valence readout</span><span id="mbon-valence">—</span></div>
-    <div class="row"><span class="k">MBON rate (Hz)</span><span id="mbon-rate">—</span></div>
-    <div class="row"><span class="k">encounters</span><span id="mbon-n">—</span></div>
-    <div class="row"><span class="k">last sniff</span><span id="mbon-last">—</span></div>
-    <h2 style="margin-top:12px">Neuromod state</h2>
-    <div class="row"><span class="k">reward</span><span id="nm-reward">—</span></div>
-    <div class="row"><span class="k">punishment</span><span id="nm-punishment">—</span></div>
-    <div class="row"><span class="k">hunger</span><span id="nm-hunger">—</span></div>
-    <div class="row"><span class="k">arousal</span><span id="nm-arousal">—</span></div>
-    <h2 style="margin-top:12px">Equity / cash</h2>
-    <div class="row"><span class="k">equity</span><span id="hd-equity">—</span></div>
-    <div class="row"><span class="k">cash</span><span id="hd-cash">—</span></div>
-    <div class="row"><span class="k">market value</span><span id="hd-mv">—</span></div>
-    <div class="row"><span class="k">hatch equity</span><span id="hd-hatch">—</span></div>
-    <div class="row"><span class="k">deaths</span><span id="hd-deaths">—</span></div>
+  <section id="panel-neural">
+    <h2>Neural state — KC→MBON balance (centered vs raw)</h2>
+    <canvas id="c-balance"></canvas>
+    <p class="kv" id="p-thresholds"></p>
   </section>
-  <section id="panel-neuron">
-    <h2>Neuron activity — MBON rate &amp; approach/avoid balance (recent encounters)</h2>
-    <canvas id="neuron-canvas"></canvas>
+  <section id="panel-decisions">
+    <h2>Per-day decision mix &amp; sugar channels</h2>
+    <canvas id="c-mix"></canvas>
+    <p class="kv" id="p-sugar"></p>
+  </section>
+  <section id="panel-intensity">
+    <h2>Encounter intensity histogram</h2>
+    <canvas id="c-intensity"></canvas>
+  </section>
+  <section id="panel-pnl">
+    <h2>Aggregate P&amp;L — cumulative realized</h2>
+    <canvas id="c-realized"></canvas>
+    <p class="kv" id="p-split"></p>
+  </section>
+  <section class="wide" id="panel-trading">
+    <h2>Trades</h2>
+    <table id="t-trades"><thead><tr>
+      <th>ts</th><th>ticker</th><th>side</th><th>shares</th><th>price</th>
+      <th>reason</th><th>realized pnl</th>
+    </tr></thead><tbody></tbody></table>
   </section>
   <section id="panel-positions">
-    <h2>Open positions</h2>
-    <table>
-      <thead>
-        <tr><th>Ticker</th><th class="num">Shares</th><th class="num">Avg cost</th><th class="num">Weight</th></tr>
-      </thead>
-      <tbody id="positions-body"></tbody>
-    </table>
+    <h2>Open positions (FIFO, mark = last fill — approximation)</h2>
+    <table id="t-positions"><thead><tr>
+      <th>ticker</th><th>shares</th><th>avg cost</th><th>mark</th><th>unrealized</th>
+    </tr></thead><tbody></tbody></table>
   </section>
-  <section id="panel-events">
+  <section id="panel-league">
+    <h2>Per-ticker realized &amp; per-day realized</h2>
+    <table id="t-league"><thead><tr><th>ticker</th><th>realized pnl</th></tr></thead><tbody></tbody></table>
+    <table id="t-daily"><thead><tr><th>day</th><th>realized pnl</th></tr></thead><tbody></tbody></table>
+  </section>
+  <section class="wide" id="panel-events">
     <h2>Event log tail</h2>
-    <ul id="eventlog"></ul>
+    <div id="events"></div>
   </section>
 </main>
 <script>
 "use strict";
-var $ = function (id) { return document.getElementById(id); };
+const DASH = "—";
+const fmt = (x, d = 2) => (x === null || x === undefined || Number.isNaN(x))
+  ? DASH : Number(x).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const el = (id) => document.getElementById(id);
+const cls = (x) => x > 0 ? "pos" : x < 0 ? "neg" : "";
 
-function fmt(x, d) {
-  if (x === null || x === undefined) return "—";
-  return Number(x).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
-}
-function cls(x) { return x > 0 ? "pos" : (x < 0 ? "neg" : ""); }
-
-// ---- canvas sizing (device-pixel sharp, no external deps) ------------------
-function fit(cv) {
-  var dpr = window.devicePixelRatio || 1;
-  var w = cv.clientWidth, h = cv.clientHeight;
-  if (cv.width !== w * dpr || cv.height !== h * dpr) {
-    cv.width = w * dpr; cv.height = h * dpr;
-  }
-  var ctx = cv.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  return { ctx: ctx, w: w, h: h };
-}
-
-// ---- equity chart -----------------------------------------------------------
-function drawEquity(series, hatch) {
-  var cv = $("equity-canvas");
-  var g = fit(cv), ctx = g.ctx, W = g.w, H = g.h;
-  ctx.clearRect(0, 0, W, H);
-  if (!series || series.length < 2) {
-    ctx.fillStyle = "#7f8f9d"; ctx.fillText("waiting for bars…", 8, 16); return;
-  }
-  var vals = series.map(function (r) { return r[1]; });
-  if (hatch !== null && hatch !== undefined) vals = vals.concat([hatch]);
-  var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
-  if (hi - lo < 1e-9) { hi += 1; lo -= 1; }
-  var pad = 6, x0 = 52, x1 = W - pad, y0 = pad, y1 = H - 18;
-  function X(i) { return x0 + (x1 - x0) * i / (series.length - 1); }
-  function Y(v) { return y1 - (y1 - y0) * (v - lo) / (hi - lo); }
-  // grid + axis labels
-  ctx.strokeStyle = "#26303a"; ctx.fillStyle = "#7f8f9d";
-  ctx.font = "10px ui-monospace, Menlo, monospace";
-  for (var k = 0; k <= 3; k++) {
-    var v = lo + (hi - lo) * k / 3, y = Y(v);
-    ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
-    ctx.fillText(v.toFixed(0), 2, y + 3);
-  }
-  // hatch line
-  if (hatch !== null && hatch !== undefined) {
-    ctx.strokeStyle = "#7f8f9d"; ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(x0, Y(hatch)); ctx.lineTo(x1, Y(hatch)); ctx.stroke();
-    ctx.setLineDash([]);
-  }
-  // equity line, colored by sign of return
-  var up = series[series.length - 1][1] >= series[0][1];
-  ctx.strokeStyle = up ? "#4ade80" : "#f87171"; ctx.lineWidth = 1.5;
+function line(ctx, pts, color, y0, y1, w, h) {
+  if (pts.length < 2) return;
   ctx.beginPath();
-  for (var i = 0; i < series.length; i++) {
-    var px = X(i), py = Y(series[i][1]);
-    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-  }
-  ctx.stroke(); ctx.lineWidth = 1;
+  pts.forEach((p, i) => {
+    const x = (i / (pts.length - 1)) * w;
+    const y = h - ((p - y0) / (y1 - y0 || 1)) * h;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke();
 }
 
-// ---- neuron-activity chart --------------------------------------------------
-// Bars: centered approach/avoid balance in [-1, 1] (green approach, red avoid).
-// Line: MBON population firing rate (Hz), scaled to the window's max.
-function drawNeuron(recent) {
-  var cv = $("neuron-canvas");
-  var g = fit(cv), ctx = g.ctx, W = g.w, H = g.h;
-  ctx.clearRect(0, 0, W, H);
-  if (!recent || !recent.length) {
-    ctx.fillStyle = "#7f8f9d"; ctx.fillText("no encounters yet…", 8, 16); return;
-  }
-  var pad = 6, x0 = 30, x1 = W - pad, y0 = pad, y1 = H - 18;
-  var mid = (y0 + y1) / 2;
-  // zero line
-  ctx.strokeStyle = "#26303a";
-  ctx.beginPath(); ctx.moveTo(x0, mid); ctx.lineTo(x1, mid); ctx.stroke();
-  var n = recent.length;
-  var slot = (x1 - x0) / n, bw = Math.max(1, slot * 0.6);
-  var maxRate = 0;
-  for (var i = 0; i < n; i++) maxRate = Math.max(maxRate, recent[i].mbon_rate_hz || 0);
-  for (var j = 0; j < n; j++) {
-    var b = Math.max(-1, Math.min(1, recent[j].balance || 0));
-    var bx = x0 + slot * j + (slot - bw) / 2;
-    var bh = (y1 - y0) / 2 * b;
-    ctx.fillStyle = b >= 0 ? "#4ade80" : "#f87171";
-    if (b >= 0) ctx.fillRect(bx, mid - bh, bw, bh);
-    else ctx.fillRect(bx, mid, bw, -bh);
-  }
-  // MBON rate line (amber), scaled to its own max
-  if (maxRate > 0) {
-    ctx.strokeStyle = "#fbbf24"; ctx.beginPath();
-    for (var m = 0; m < n; m++) {
-      var ly = y1 - (y1 - y0) * (recent[m].mbon_rate_hz || 0) / maxRate;
-      var lx = x0 + slot * m + slot / 2;
-      if (m === 0) ctx.moveTo(lx, ly); else ctx.lineTo(lx, ly);
-    }
-    ctx.stroke();
-  }
-  ctx.fillStyle = "#7f8f9d"; ctx.font = "10px ui-monospace, Menlo, monospace";
-  ctx.fillText("+1", 2, y0 + 8); ctx.fillText("0", 2, mid + 3); ctx.fillText("-1", 2, y1);
-  ctx.fillText("MBON Hz max " + maxRate.toFixed(1), x0 + 4, y0 + 8);
+function draw(canvas, series) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const flat = series.map(([pts]) => pts);
+  const vals = flat.flat().filter((v) => v !== null);
+  if (!vals.length) { ctx.fillText("no data yet", 8, 16); return; }
+  let y0 = Math.min(...vals), y1 = Math.max(...vals);
+  if (y0 === y1) { y0 -= 1; y1 += 1; }
+  const pad = (y1 - y0) * 0.08; y0 -= pad; y1 += pad;
+  ctx.strokeStyle = "#2a3440"; ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+  const colors = ["#7ec8e3", "#e0a040", "#7ad48a", "#e88", "#b48ce0"];
+  series.forEach(([pts, color, dashed], i) => {
+    ctx.setLineDash(dashed ? [4, 4] : []);
+    line(ctx, pts, color || colors[i % colors.length], y0, y1, w, h);
+    ctx.setLineDash([]);
+  });
+  ctx.fillStyle = "#5a6a78"; ctx.font = "11px monospace";
+  ctx.fillText(fmt(y1), 4, 12); ctx.fillText(fmt(y0), 4, h - 4);
 }
 
-// ---- panels -----------------------------------------------------------------
 function render(s) {
-  var st = $("status");
-  st.textContent = s.status;
-  st.className = s.status;
-  $("rundir").textContent = s.run_dir;
-  $("latest").textContent = s.latest_ts ? ("bar " + s.latest_ts + " · " + s.n_bars + " bars") : "";
-  $("hd-equity").textContent = fmt(s.equity, 2);
-  $("hd-cash").textContent = fmt(s.cash, 2);
-  $("hd-mv").textContent = fmt(s.market_value, 2);
-  $("hd-hatch").textContent = fmt(s.hatch_equity, 2);
-  $("hd-deaths").textContent = s.deaths;
-  drawEquity(s.equity_series, s.hatch_equity);
+  el("status").textContent = s.status;
+  el("status").className = s.status;
+  el("h-equity").textContent = fmt(s.equity);
+  el("h-cash").textContent = fmt(s.cash);
+  el("h-hatch").textContent = fmt(s.hatch_equity);
+  el("h-deaths").textContent = s.deaths;
+  el("h-bars").textContent = s.n_bars;
+  el("h-ts").textContent = s.latest_ts || DASH;
 
-  var m = s.mbon;
-  $("mbon-balance").textContent = m ? fmt(m.balance, 4) : "—";
-  $("mbon-balance").className = "big " + (m ? cls(m.balance) : "");
-  $("mbon-raw").textContent = m ? fmt(m.raw_balance, 4) : "—";
-  $("mbon-valence").textContent = m ? fmt(m.valence_readout, 4) : "—";
-  $("mbon-rate").textContent = m ? fmt(m.mbon_rate_hz, 2) : "—";
-  $("mbon-n").textContent = s.n_encounters;
-  $("mbon-last").textContent = m ? (m.ticker + " @ " + m.ts) : "—";
-  var nm = s.neuromod;
-  $("nm-reward").textContent = nm ? fmt(nm.reward, 4) : "—";
-  $("nm-punishment").textContent = nm ? fmt(nm.punishment, 4) : "—";
-  $("nm-hunger").textContent = nm ? fmt(nm.hunger, 4) : "—";
-  $("nm-arousal").textContent = nm ? fmt(nm.arousal, 4) : "—";
-  drawNeuron(s.neuron_activity && s.neuron_activity.recent);
-
-  var tb = $("positions-body");
-  tb.innerHTML = "";
-  (s.positions || []).forEach(function (p) {
-    var tr = document.createElement("tr");
-    var weight = (s.equity && s.equity > 0) ? (100 * p.shares * p.avg_cost / s.equity) : 0;
-    [p.ticker, p.shares, fmt(p.avg_cost, 2), fmt(weight, 1) + "%"].forEach(function (v, i) {
-      var td = document.createElement("td");
-      if (i > 0) td.className = "num";
-      td.textContent = v;
-      tr.appendChild(td);
+  const eq = (s.equity_series || []).map((r) => r[1]);
+  const hatch = s.hatch_equity;
+  draw(el("c-equity"), [
+    [eq, "#7ec8e3"],
+    [hatch !== null ? eq.map(() => hatch) : [], "#b48ce0", true],
+  ]);
+  // death marks as vertical ticks along the top
+  if ((s.death_marks || []).length) {
+    const c = el("c-equity");
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#e55";
+    (s.death_marks || []).forEach((d, i) => {
+      const x = ((i + 1) / (s.death_marks.length + 1)) * c.clientWidth;
+      ctx.fillRect(x, 0, 2, 8);
     });
-    tb.appendChild(tr);
-  });
-  if (!(s.positions || []).length) {
-    var tr0 = document.createElement("tr");
-    var td0 = document.createElement("td");
-    td0.colSpan = 4; td0.textContent = "no open positions";
-    td0.style.color = "#7f8f9d";
-    tr0.appendChild(td0); tb.appendChild(tr0);
   }
-}
 
-function describe(ev) {
-  if (ev.type === "order") return ev.side + " " + ev.shares + " " + ev.ticker + " @ " + ev.price + " (" + ev.reason + ")";
-  if (ev.type === "encounter") return ev.ticker + " balance " + ev.balance + " (" + ev.mbon_rate_hz + " Hz)";
-  if (ev.type === "decision") return ev.ticker + " → " + ev.action + " (" + ev.reason + ")";
-  if (ev.type === "sugar_shock") return "reward " + ev.reward + " punishment " + ev.punishment + " hunger " + ev.hunger;
-  if (ev.type === "death") return "equity " + ev.equity + " ≤ " + ev.hatch_equity + " · hatching fresh fly";
-  if (ev.type === "hatch") return "hatch equity " + ev.hatch_equity;
-  if (ev.type === "wake" || ev.type === "sleep") return "";
-  return JSON.stringify(ev);
-}
+  const bal = (s.neural?.balance_series || []).map((r) => r[1]);
+  const raw = (s.neural?.balance_series || []).map((r) => r[2]);
+  const anc = (s.neural?.anchor_series || []).map((r) => r[1]);
+  draw(el("c-balance"), [[bal, "#7ec8e3"], [raw, "#e0a040"], [anc, "#b48ce0", true]]);
+  const thr = s.neural?.thresholds;
+  el("p-thresholds").textContent = thr
+    ? "inferred thresholds — approach ≥ " + fmt(thr.approach, 4)
+      + ", avoid ≤ −" + fmt(thr.avoid, 4)
+    : "thresholds: not inferable from receipts";
 
-function refreshEvents() {
-  fetch("/api/events?limit=40").then(function (r) { return r.json(); }).then(function (res) {
-    var ul = $("eventlog");
-    ul.innerHTML = "";
-    res.events.forEach(function (ev) {
-      var li = document.createElement("li");
-      var t = document.createElement("span"); t.className = "t"; t.textContent = ev.type;
-      var ts = document.createElement("span"); ts.className = "ts"; ts.textContent = ev.ts || "";
-      li.appendChild(t); li.appendChild(ts);
-      li.appendChild(document.createTextNode(describe(ev)));
-      ul.appendChild(li);
+  const mix = s.neural?.decision_mix || {};
+  const days = Object.keys(mix);
+  const buckets = ["approach", "avoid", "neutral", "cap", "dust"];
+  draw(el("c-mix"), buckets.map((b, i) => [days.map((d) => mix[d][b] || 0), null, i === 2]));
+  const sugar = s.neural?.sugar_daily || {};
+  const sdays = Object.keys(sugar);
+  el("p-sugar").textContent = sdays.length
+    ? "sugar_shock " + sdays.map((d) => d + ": r=" + fmt(sugar[d].reward, 4)
+      + " p=" + fmt(sugar[d].punishment, 4) + " h=" + fmt(sugar[d].hunger, 4)
+      + " a=" + fmt(sugar[d].arousal, 4)).join("  ")
+    : "no sugar_shock events";
+
+  const ih = s.neural?.intensity_hist;
+  if (ih) {
+    const c = el("c-intensity"), dpr = window.devicePixelRatio || 1;
+    c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+    const ctx = c.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, c.clientWidth, c.clientHeight);
+    const max = Math.max(...ih.counts, 1);
+    const bw = c.clientWidth / ih.counts.length;
+    ih.counts.forEach((n, i) => {
+      const bh = (n / max) * (c.clientHeight - 16);
+      ctx.fillStyle = "#7ec8e3";
+      ctx.fillRect(i * bw + 1, c.clientHeight - bh - 12, bw - 2, bh);
+      ctx.fillStyle = "#5a6a78"; ctx.font = "10px monospace";
+      ctx.fillText(ih.edges[i].toFixed(1), i * bw + 1, c.clientHeight - 2);
     });
-    ul.scrollTop = ul.scrollHeight;
+  }
+
+  draw(el("c-realized"), [[(s.realized_series || []).map((r) => r[1]), "#7ad48a"]]);
+  const u = s.unrealized_total;
+  el("p-split").textContent = "realized " + fmt(s.realized_total)
+    + "  unrealized " + fmt(u)
+    + "  equity " + fmt(s.equity)
+    + "  market value " + fmt(s.market_value);
+
+  const tb = el("t-trades").tBodies[0];
+  tb.innerHTML = "";
+  (s.trades || []).forEach((t) => {
+    const tr = tb.insertRow();
+    [t.ts, t.ticker, t.side, fmt(t.shares, 0), fmt(t.price), t.reason,
+     [fmt(t.realized_pnl), cls(t.realized_pnl)]].forEach((v, i) => {
+      const td = tr.insertCell();
+      if (Array.isArray(v)) { td.textContent = v[0]; td.className = v[1]; }
+      else td.textContent = v ?? DASH;
+    });
   });
+
+  const pb = el("t-positions").tBodies[0];
+  pb.innerHTML = "";
+  (s.open_positions || []).forEach((p) => {
+    const tr = pb.insertRow();
+    [p.ticker, fmt(p.shares, 0), fmt(p.avg_cost, 4), fmt(p.mark, 4),
+     [fmt(p.unrealized), cls(p.unrealized)]].forEach((v, i) => {
+      const td = tr.insertCell();
+      if (Array.isArray(v)) { td.textContent = v[0]; td.className = v[1]; }
+      else td.textContent = v ?? DASH;
+    });
+  });
+  if (!pb.rows.length) pb.innerHTML = "<tr><td colspan=5 class=dash>flat</td></tr>";
+
+  const lb = el("t-league").tBodies[0];
+  lb.innerHTML = "";
+  Object.entries(s.pnl_by_ticker || {}).forEach(([t, v]) => {
+    const tr = lb.insertRow();
+    tr.insertCell().textContent = t;
+    const td = tr.insertCell(); td.textContent = fmt(v); td.className = cls(v);
+  });
+  if (!lb.rows.length) lb.innerHTML = "<tr><td colspan=2 class=dash>—</td></tr>";
+
+  const db = el("t-daily").tBodies[0];
+  db.innerHTML = "";
+  Object.entries(s.realized_daily || {}).forEach(([d, v]) => {
+    const tr = db.insertRow();
+    tr.insertCell().textContent = d;
+    const td = tr.insertCell(); td.textContent = fmt(v); td.className = cls(v);
+  });
+  if (!db.rows.length) db.innerHTML = "<tr><td colspan=2 class=dash>—</td></tr>";
 }
 
-// ---- SSE push (auto-reconnects; server polls receipts on a fixed interval) --
-var es = new EventSource("/api/stream");
-es.addEventListener("state", function (e) {
-  $("conn").textContent = "sse live";
-  render(JSON.parse(e.data));
-  refreshEvents();
-});
-es.onopen = function () { $("conn").textContent = "sse live"; };
-es.onerror = function () { $("conn").textContent = "sse reconnecting…"; };
+async function pollEvents() {
+  try {
+    const r = await fetch("/api/events?limit=50");
+    const j = await r.json();
+    const box = el("events");
+    box.innerHTML = "";
+    j.events.slice().reverse().forEach((e) => {
+      const div = document.createElement("div");
+      div.className = "ev";
+      const type = document.createElement("span");
+      type.className = "type"; type.textContent = e.type || "?";
+      div.appendChild(type);
+      div.appendChild(document.createTextNode("  " + JSON.stringify(e)));
+      box.appendChild(div);
+    });
+  } catch (_) { /* transient */ }
+}
 
-// immediate first paint (SSE pushes the same snapshot right after)
-fetch("/api/state").then(function (r) { return r.json(); }).then(render);
-refreshEvents();
-window.addEventListener("resize", function () {
-  fetch("/api/state").then(function (r) { return r.json(); }).then(render);
-});
+const es = new EventSource("/api/stream");
+es.addEventListener("state", (m) => { render(JSON.parse(m.data)); pollEvents(); });
+es.onerror = () => { el("status").textContent = "reconnecting"; };
+setInterval(pollEvents, 5000);
 </script>
 </body>
 </html>

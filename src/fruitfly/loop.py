@@ -2,8 +2,9 @@
 
 One simulated fly forages a 1-minute-bar market session. Per DESIGN §6 the
 fly does not watch a watchlist: every bar, the basket is ranked by plume
-intensity (|1-bar return| + relative volume) and the ``top_k`` smelliest
-movers become the active plume set; flat stocks are odorless. The fly
+intensity (|20-bar momentum| × 20 + relative volume — direction-agnostic,
+DESIGN v0.6) and the ``top_k`` smelliest movers become the active plume set;
+dead stocks (zero 1-bar return AND zero 20-bar momentum) are odorless. The fly
 samples **one plume per bar**, round-robin through the active set — the
 rotation pointer persists across bars so successive bars start at different
 plumes, and the starting offset is drawn from the loop's RNG at the first
@@ -28,10 +29,19 @@ fly's innate balance**: the structural KC→MBON wiring is avoid-biased
 (~ -0.35 on the real chassis at every drive level), so at hatch the fly takes
 one neutral calibration sniff (mean basket identity, no market state, no
 noise) and every encounter's balance is centered on that anchor (the raw
-``valence_readout`` and raw balance are also logged for T9). ``balance >
+``valence_readout`` and raw balance are also logged for T9). The anchor is
+re-measured at every sleep (T9, v0.6 daily refresh): as learning shifts the
+innate bias, the centering drifts back with it instead of going stale.
+``balance >
 approach_thr``
 → BUY/add, ``balance < -avoid_thr`` → SELL (valence-flip exit on a held
-position), otherwise pass. Position size maps the MBON population firing
+position), otherwise pass. Two v0.6 additions ride on the centered balance:
+the LC→MBON *structural looming* response (connectome synapses, log1p-scaled
+like ``Plasticity.baseline``) enters at a fixed weight —
+``balance_used = centered + lambda_struct × structural_score`` — so a
+crash-shaped bar moves the decision even with a silent learned readout; and
+the decision consumes ``balance_used``, while the encounter receipt logs both
+the raw pieces and the combined value. Position size maps the MBON population firing
 rate (post-spikes over MBON nodes / duration) through
 ``tanh(rate / MBON_RATE_SCALE_HZ)``, floored at ``MIN_SIZE_FRAC`` and capped
 at 1.0; the per-order notional is ``frac * equity / position_cap`` (D13).
@@ -75,7 +85,13 @@ Close of day (DESIGN §7): the day's realized P&L settles into sugar/shock
 maps drawdown to [0, 1] hitting 1.0 exactly at the death threshold (D14),
 arousal maps the day's mean |1-bar return| to [0, 1]; one
 ``Plasticity.observe`` consumes the day's accumulated spike counts, then
-``Plasticity.sleep()`` consolidates and the fly logs the sleep event.
+``Plasticity.sleep()`` consolidates, the anchor is re-measured, and the fly
+logs the sleep + anchor events. Complementing the diffuse daily ritual, each
+position close emits a precise ``trade_credit`` (D6, v0.6): the eligibility
+snapshot taken at the opening buy/add is credited through
+``Plasticity.observe_trade`` with a dopamine gate built from the trade's
+realized P&L. Death liquidation clears the snapshots — a dying brain gets no
+per-exit credit.
 
 Death (D14): when equity <= ``hatch_equity * (1 + death_threshold)`` the fly
 dies: remaining positions are liquidated immediately at the death bar's
@@ -220,6 +236,13 @@ class BacktestConfig:
     end: str
     #: Plume-filter width (D3): how many smelliest movers are in the active set.
     top_k: int = 5
+    #: Grudge-protection width (T9, v0.6): strongest learned KC→MBON
+    #: associations the sleep consolidation pass preserves.
+    grudge_top_k: int = 16
+    #: Structural looming drive weight (DESIGN v0.6 §5): the LC→MBON
+    #: structural response enters the decision balance at this fixed λ:
+    #: ``balance_used = centered + lambda_struct × structural_score``.
+    lambda_struct: float = 0.05
     #: Concurrent-position cap (D13).
     position_cap: int = 10
     #: Biological time stepped per 1-minute bar (D16).
@@ -258,6 +281,8 @@ class BacktestConfig:
     def __post_init__(self) -> None:
         if self.top_k < 1:
             raise ValueError("top_k must be >= 1")
+        if self.grudge_top_k < 1:
+            raise ValueError("grudge_top_k must be >= 1")
         if self.position_cap < 1:
             raise ValueError("position_cap must be >= 1")
         if self.ms_per_bar <= 0:
@@ -406,9 +431,13 @@ def _plume_set(
 ) -> list[tuple[str, float]]:
     """Rank the basket by plume intensity at ``ts`` (DESIGN §6.1, D3).
 
-    Intensity = |1-bar return| + volume ratio; flat stocks (zero 1-bar
-    return) are odorless and skipped entirely. Returns the top ``top_k`` as
-    ``(ticker, intensity)``, ties broken by ticker for determinism.
+    Intensity = |20-bar momentum| × 20 + volume ratio (DESIGN v0.6 amendment):
+    the 20-bar move expressed in 1-bar-equivalent magnitude plus the volume
+    ratio. Direction-agnostic — persistent movers of either sign surface, not
+    just last-bar jumps. A dead ticker (``ret1 == 0`` AND ``mom20 == 0``) is
+    odorless and skipped entirely; a flat last bar on an otherwise-moving
+    ticker still smells. Returns the top ``top_k`` as ``(ticker, intensity)``,
+    ties broken by ticker for determinism.
     """
     ranked: list[tuple[float, str]] = []
     for ticker, df in frames.items():
@@ -416,9 +445,10 @@ def _plume_set(
         if i < 1 or df.index[i] != ts:
             continue
         features, ret1, volume_ratio = _features_at(df, i)
-        if ret1 == 0.0:
-            continue  # flat -> odorless
-        ranked.append((abs(ret1) + volume_ratio, ticker))
+        mom20 = features["mom20"]
+        if ret1 == 0.0 and mom20 == 0.0:
+            continue  # dead -> odorless
+        ranked.append((abs(mom20) * 20.0 + volume_ratio, ticker))
     ranked.sort(key=lambda t: (-t[0], t[1]))
     return [(t, s) for s, t in ranked[:top_k]]
 
@@ -563,7 +593,7 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     """Run the foraging backtest (DESIGN §7) and write equity.csv + events.jsonl."""
     t0 = time.perf_counter()
     chassis = _resolve_chassis(config)
-    plasticity = Plasticity(chassis)
+    plasticity = Plasticity(chassis, top_k=config.grudge_top_k)
     sim = LIFSim(
         chassis,
         dt_ms=config.dt_ms,
@@ -585,6 +615,20 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     pop = chassis.nodes["population"].to_numpy()
     upn_rows, channels = upn_channels(chassis)
     mbon_rows = np.flatnonzero(pop == "MBON")
+    # Structural looming view (DESIGN v0.6 §5): the LC→MBON connectome
+    # synapses as a dense float64 matrix, log1p-scaled to mean 1 over their
+    # nonzero support (the ``Plasticity.baseline`` convention). A chassis
+    # without LC-looming cells — or without LC→MBON synapses — leaves the
+    # structural score at 0 for every encounter.
+    lc_rows = np.flatnonzero(pop == "LC-looming")
+    w_struct: np.ndarray | None = None
+    if lc_rows.size:
+        w_lc = np.asarray(chassis.adj[lc_rows][:, mbon_rows].toarray(), dtype=np.float64)
+        lc_support = w_lc > 0.0
+        if lc_support.any():
+            w_lc = np.log1p(w_lc)
+            w_lc /= w_lc[lc_support].mean()
+            w_struct = w_lc
     n = chassis.n_neurons
 
     start_ts, end_ts = _window(config.start, config.end)
@@ -662,6 +706,9 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     hatch_equity = config.initial_cash
     positions: dict[str, _Position] = {}
     last_close: dict[str, float] = {}
+    # Per-exit dopamine (DESIGN v0.6 D6): ticker -> eligibility snapshot
+    # captured at the position's opening buy/add fill, credited at close.
+    entry_elig: dict[str, np.ndarray] = {}
     pending_book = PendingOrderBook(frames, config.fill_mode)
     cur_day: date | None = None
     pointer = 0
@@ -695,6 +742,11 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             total = pos.shares + shares
             pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total
             pos.shares = total
+        # Snapshot the eligibility trace for this position's opening
+        # encounter (DESIGN v0.6 D6). Overwritten on add — the latest
+        # snapshot wins, because the realized P&L at close is credited to
+        # the most recent entry decision for the position.
+        entry_elig[o.ticker] = plasticity.eligibility.copy()
         order(ts, o, price, shares, None, cash)
 
     def apply_sell(ts: pd.Timestamp, o: PendingOrder, price: float) -> float | None:
@@ -709,6 +761,35 @@ def run_backtest(config: BacktestConfig) -> RunResult:
         cash += proceeds
         realized = proceeds - pos.shares * pos.avg_cost
         order(ts, o, price, pos.shares, realized, cash)
+        snap = entry_elig.pop(o.ticker, None)
+        if snap is not None:
+            # Per-exit dopamine (DESIGN v0.6 D6, T9 addendum 2026-09-15):
+            # credit the opening encounter's eligibility snapshot with the
+            # trade's realized P&L normalized by the trade's OWN notional
+            # (clipped to [-1, 1]) — a trade must teach in proportion to its
+            # own outcome, not the portfolio's size (hatch-equity scaling
+            # left the gate ~40x too weak to overcome pessimistic-fill
+            # spread costs). Death liquidation clears the snapshots first,
+            # so it never reaches this path.
+            notional = pos.shares * pos.avg_cost
+            reward = min(1.0, max(0.0, realized) / notional) if notional > 0 else 0.0
+            punishment = min(1.0, max(0.0, -realized) / notional) if notional > 0 else 0.0
+            plasticity.observe_trade(
+                NeuromodState(
+                    reward=reward, punishment=punishment, hunger=0.0, arousal=0.0
+                ),
+                snap,
+            )
+            emit(
+                {
+                    "type": "trade_credit",
+                    "ts": ts.isoformat(),
+                    "ticker": o.ticker,
+                    "realized_pnl": round(realized, 6),
+                    "reward": round(reward, 9),
+                    "punishment": round(punishment, 9),
+                }
+            )
         return realized
 
     def close_position(ts: pd.Timestamp, ticker: str, reason: str) -> float:
@@ -728,7 +809,7 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     def settle_and_sleep(day: date) -> None:
         """Close-of-day: sugar/shock settle -> observe -> sleep (DESIGN §7.3)."""
         nonlocal day_realized, day_abs_ret_sum, day_abs_ret_n, hunger_armed
-        nonlocal daily_mbon_drive, daily_signal_encounters
+        nonlocal daily_mbon_drive, daily_signal_encounters, anchor
         reward = max(0.0, day_realized) / hatch_equity
         punishment = max(0.0, -day_realized) / hatch_equity
         drawdown = max(0.0, 1.0 - equity / hatch_equity)
@@ -761,6 +842,21 @@ def run_backtest(config: BacktestConfig) -> RunResult:
         )
         plasticity.sleep()
         emit({"type": "sleep", "ts": f"{day}T20:00:00+00:00"})
+        # Daily anchor refresh (DESIGN v0.6 T9): re-measure the innate
+        # balance with the current (learned) weights — one extra neutral
+        # sniff per sleep, deterministic (RNG-free) — so learned drift in
+        # the structural bias does not go stale in the centering.
+        anchor = _innate_balance(
+            chassis, plasticity, sim, upn_rows, channels, list(frames),
+            config.ms_per_bar,
+        )
+        emit(
+            {
+                "type": "anchor",
+                "ts": f"{day}T20:00:00+00:00",
+                "balance": round(anchor, 9),
+            }
+        )
         day_realized = 0.0
         day_abs_ret_sum = 0.0
         day_abs_ret_n = 0
@@ -905,6 +1001,17 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             centered = (
                 balance - anchor if approach_drive + avoid_drive > 0.0 else 0.0
             )
+            # Structural looming drive (DESIGN v0.6 §5): the LC→MBON
+            # connectome response to this encounter's LC spikes, entering the
+            # decision balance at a small fixed λ. Zero when the chassis has
+            # no LC→MBON path (or a silent LC population).
+            if w_struct is not None:
+                structural_score = float(
+                    plasticity.mbon_valence @ (w_struct.T @ spikes[lc_rows])
+                )
+            else:
+                structural_score = 0.0
+            balance_used = centered + config.lambda_struct * structural_score
 
             emit(
                 {
@@ -914,6 +1021,8 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                     "intensity": round(intensity, 9),
                     "balance": round(centered, 9),
                     "raw_balance": round(balance, 9),
+                    "structural_score": round(structural_score, 9),
+                    "balance_used": round(balance_used, 9),
                     "valence_readout": round(raw_score, 6),
                     "mbon_rate_hz": round(mbon_rate, 6),
                 }
@@ -923,7 +1032,7 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             held = ticker in positions
             price = last_close[ticker]
             action, reason = _decide(
-                centered, held,
+                balance_used, held,
                 len(positions) + pending_book.n_buys() >= config.position_cap,
                 config.approach_thr, config.avoid_thr,
             )
@@ -976,11 +1085,14 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                 }
             )
             n_deaths += 1
+            # No per-exit credit for death liquidation: clear the opening
+            # snapshots before the liquidation closes reach apply_sell.
+            entry_elig.clear()
             for ticker in sorted(positions):
                 day_realized += close_position(ts, ticker, "death_liquidation")
             for o in pending_book.cancel_all():
                 cancel(o, ts, "death")  # the brain that placed them is gone
-            plasticity = Plasticity(chassis)
+            plasticity = Plasticity(chassis, top_k=config.grudge_top_k)
             sim.reset(config.seed)
             daily_spikes.fill(0)
             daily_mbon_drive.fill(0)

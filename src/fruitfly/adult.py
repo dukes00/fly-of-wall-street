@@ -37,9 +37,10 @@ The dashboard (D18/D21) and post-mortem read adult runs unchanged.
 ``_decide`` (decision map), ``_innate_balance`` (hatch calibration sniff),
 ``_size_fraction`` (sizing), plus the gain/threshold constants (``SMELL_GAIN``,
 ``VISION_WINDOW_BARS``, ``NOISE_SIGMA_MV``, ...) and the ``_Position`` book
-record. Known loop quirk mirrored for receipt parity: a death bar emits the
-``hatch`` event twice (loop.py emits it after the brain reset and again after
-the anchor re-calibration); adult reproduces that exactly.
+record. Death parity (v0.6): the death bar clears the per-exit eligibility
+snapshots before liquidation (no trade_credit on death) and emits exactly one
+``hatch`` after the brain reset, then re-calibrates the anchor — same order as
+loop.py.
 
 **Persistence (resume semantics).** :class:`FlyState` captures every mutable
 byte of the fly — cash/hatch equity/positions/last marks, hunger and hatch
@@ -159,6 +160,10 @@ class AdultConfig:
     #: against the chassis fingerprint before injection.
     larval_weights: str | Path | None = None
     top_k: int = 5
+    grudge_top_k: int = 16
+    #: Structural looming drive weight (DESIGN v0.6 §5): ``balance_used =
+    #: centered + lambda_struct × structural_score`` (mirror of the loop).
+    lambda_struct: float = 0.05
     position_cap: int = 10
     ms_per_bar: float = 500.0
     death_threshold: float = DEATH_THRESHOLD
@@ -184,6 +189,8 @@ class AdultConfig:
             raise ValueError("persist_every must be >= 1")
         if self.top_k < 1:
             raise ValueError("top_k must be >= 1")
+        if self.grudge_top_k < 1:
+            raise ValueError("grudge_top_k must be >= 1")
         if self.position_cap < 1:
             raise ValueError("position_cap must be >= 1")
         if self.ms_per_bar <= 0:
@@ -210,6 +217,8 @@ class AdultConfig:
             start=self.start,
             end=self.end,
             top_k=self.top_k,
+            grudge_top_k=self.grudge_top_k,
+            lambda_struct=self.lambda_struct,
             position_cap=self.position_cap,
             ms_per_bar=self.ms_per_bar,
             death_threshold=self.death_threshold,
@@ -242,6 +251,8 @@ class AdultConfig:
             "start": self.start,
             "end": self.end,
             "top_k": self.top_k,
+            "grudge_top_k": self.grudge_top_k,
+            "lambda_struct": self.lambda_struct,
             "position_cap": self.position_cap,
             "ms_per_bar": self.ms_per_bar,
             "death_threshold": self.death_threshold,
@@ -311,6 +322,9 @@ class FlyState:
     cash: float = 0.0
     hatch_equity: float = 0.0
     equity: float = 0.0
+    #: Per-exit dopamine (DESIGN v0.6 D6): ticker -> eligibility snapshot
+    #: captured at the opening buy/add fill, credited at close.
+    entry_elig: dict[str, np.ndarray] = field(default_factory=dict)
     positions: dict[str, _Position] = field(default_factory=dict)
     last_close: dict[str, float] = field(default_factory=dict)
     #: Queued pessimistic next-bar orders (loop parity: ``PendingOrderBook``).
@@ -375,6 +389,10 @@ class FlyState:
                 }
                 for o in self.pending
             ],
+            "entry_elig": {
+                t: np.asarray(a, dtype=np.float64).tolist()
+                for t, a in self.entry_elig.items()
+            },
             "cur_day": self.cur_day,
             "pointer": self.pointer,
             "pointer_drawn": self.pointer_drawn,
@@ -439,6 +457,9 @@ class FlyState:
             )
             for o in payload["pending"]
         ]
+        state.entry_elig = {
+            t: np.asarray(a, dtype=np.float64) for t, a in payload["entry_elig"].items()
+        }
         state.cur_day = payload["cur_day"]
         state.pointer = payload["pointer"]
         state.pointer_drawn = payload["pointer_drawn"]
@@ -776,14 +797,31 @@ class AdultRun:
             self._equity_writer.writerow(["timestamp", "equity", "cash", "n_positions"])
 
         # --- brain (fresh build, then state restore on resume) --------------
-        plasticity = Plasticity(chassis)
+        self._mbon_rows = np.flatnonzero(pop == "MBON")
+        # Structural looming view (DESIGN v0.6 §5): the LC→MBON connectome
+        # synapses, log1p-scaled to mean 1 over their nonzero support (the
+        # ``Plasticity.baseline`` convention); None when the chassis has no
+        # LC→MBON path. Built exactly like loop.run_backtest.
+        lc_rows = np.flatnonzero(pop == "LC-looming")
+        w_struct: np.ndarray | None = None
+        if lc_rows.size:
+            w_lc = np.asarray(
+                chassis.adj[lc_rows][:, self._mbon_rows].toarray(), dtype=np.float64
+            )
+            lc_support = w_lc > 0.0
+            if lc_support.any():
+                w_lc = np.log1p(w_lc)
+                w_lc /= w_lc[lc_support].mean()
+                w_struct = w_lc
+        self._lc_rows = lc_rows
+        self._w_struct = w_struct
         sim = LIFSim(
             chassis,
             dt_ms=cfg.dt_ms,
             seed=cfg.seed,
             std_beta=cfg.std_beta,
-            std_tau_rec_ms=cfg.std_tau_rec_ms,
         )
+        plasticity = Plasticity(chassis, top_k=cfg.grudge_top_k)
         if resumed:
             plasticity.weights[...] = st.weights
             plasticity.eligibility[...] = st.eligibility
@@ -851,7 +889,7 @@ class AdultRun:
             day_key = ts.date().isoformat()
             if day_key != st.cur_day:
                 if st.cur_day is not None:
-                    self._settle_and_sleep(st.cur_day)
+                    self._settle_and_sleep(st.cur_day, frames)
                 st.cur_day = day_key
                 st.pointer_drawn = False
                 self._emit({"type": "wake", "ts": ts.isoformat()})
@@ -868,7 +906,7 @@ class AdultRun:
             for o in self._pending_book.cancel_all():
                 self._cancel(o, pd.Timestamp(st.last_ts), "run_end")
         if st.cur_day is not None:
-            self._settle_and_sleep(st.cur_day)
+            self._settle_and_sleep(st.cur_day, frames)
 
         self._persist(state_path)
         events_file.close()
@@ -977,6 +1015,10 @@ class AdultRun:
             total = pos.shares + shares
             pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total
             pos.shares = total
+        # Snapshot the eligibility trace for this position's opening
+        # encounter (DESIGN v0.6 D6); overwritten on add — the latest
+        # snapshot wins (loop parity with ``apply_buy``).
+        st.entry_elig[o.ticker] = self._plasticity.eligibility.copy()
         self._order(ts, o, price, shares, None, st.cash)
 
     def _apply_sell(self, ts: pd.Timestamp, o: PendingOrder, price: float) -> float | None:
@@ -990,6 +1032,30 @@ class AdultRun:
         st.cash += proceeds
         realized = proceeds - pos.shares * pos.avg_cost
         self._order(ts, o, price, pos.shares, realized, st.cash)
+        snap = st.entry_elig.pop(o.ticker, None)
+        if snap is not None:
+            # Per-exit dopamine (DESIGN v0.6 D6, T9 addendum 2026-09-15):
+            # normalized by the trade's OWN notional (clipped to [-1, 1]);
+            # loop parity with ``apply_sell``.
+            notional = pos.shares * pos.avg_cost
+            reward = min(1.0, max(0.0, realized) / notional) if notional > 0 else 0.0
+            punishment = min(1.0, max(0.0, -realized) / notional) if notional > 0 else 0.0
+            self._plasticity.observe_trade(
+                NeuromodState(
+                    reward=reward, punishment=punishment, hunger=0.0, arousal=0.0
+                ),
+                snap,
+            )
+            self._emit(
+                {
+                    "type": "trade_credit",
+                    "ts": ts.isoformat(),
+                    "ticker": o.ticker,
+                    "realized_pnl": round(realized, 6),
+                    "reward": round(reward, 9),
+                    "punishment": round(punishment, 9),
+                }
+            )
         return realized
 
     def _close_position(self, ts: pd.Timestamp, ticker: str, reason: str) -> float:
@@ -1013,9 +1079,33 @@ class AdultRun:
             realized,
             st.cash,
         )
+        snap = st.entry_elig.pop(ticker, None)
+        if snap is not None:
+            # Per-exit dopamine (DESIGN v0.6 D6, T9 addendum 2026-09-15):
+            # normalized by the trade's OWN notional (clipped to [-1, 1]);
+            # loop parity with ``apply_sell``.
+            notional = pos.shares * pos.avg_cost
+            reward = min(1.0, max(0.0, realized) / notional) if notional > 0 else 0.0
+            punishment = min(1.0, max(0.0, -realized) / notional) if notional > 0 else 0.0
+            self._plasticity.observe_trade(
+                NeuromodState(
+                    reward=reward, punishment=punishment, hunger=0.0, arousal=0.0
+                ),
+                snap,
+            )
+            self._emit(
+                {
+                    "type": "trade_credit",
+                    "ts": ts.isoformat(),
+                    "ticker": ticker,
+                    "realized_pnl": round(realized, 6),
+                    "reward": round(reward, 9),
+                    "punishment": round(punishment, 9),
+                }
+            )
         return realized
 
-    def _settle_and_sleep(self, day) -> None:
+    def _settle_and_sleep(self, day, frames: dict[str, pd.DataFrame]) -> None:
         """Close-of-day: sugar/shock settle -> observe -> sleep (DESIGN §7.3)."""
         cfg, st = self._cfg, self._st
         reward = max(0.0, st.day_realized) / st.hatch_equity
@@ -1045,6 +1135,17 @@ class AdultRun:
         self._emit({"type": "sleep", "ts": f"{day}T20:00:00+00:00"})
         st.day_realized = 0.0
         st.day_abs_ret_sum = 0.0
+        # Daily anchor refresh (DESIGN v0.6 T9): re-measure the innate
+        # balance with the current (learned) weights — one extra neutral
+        # sniff per sleep, deterministic (RNG-free).
+        st.anchor = self._innate(list(frames))
+        self._emit(
+            {
+                "type": "anchor",
+                "ts": f"{day}T20:00:00+00:00",
+                "balance": round(st.anchor, 9),
+            }
+        )
         st.day_abs_ret_n = 0
         st.daily_spikes.fill(0)
         st.daily_mbon_drive.fill(0)
@@ -1178,6 +1279,18 @@ class AdultRun:
             centered = (
                 balance - st.anchor if approach_drive + avoid_drive > 0.0 else 0.0
             )
+            # Structural looming drive (DESIGN v0.6 §5): the LC→MBON
+            # connectome response to this encounter's LC spikes, entering
+            # the decision balance at a small fixed λ. Zero when the
+            # chassis has no LC→MBON path (or a silent LC population).
+            if self._w_struct is not None:
+                structural_score = float(
+                    self._plasticity.mbon_valence
+                    @ (self._w_struct.T @ spikes[self._lc_rows])
+                )
+            else:
+                structural_score = 0.0
+            balance_used = centered + cfg.lambda_struct * structural_score
 
             self._emit(
                 {
@@ -1187,6 +1300,8 @@ class AdultRun:
                     "intensity": round(intensity, 9),
                     "balance": round(centered, 9),
                     "raw_balance": round(balance, 9),
+                    "structural_score": round(structural_score, 9),
+                    "balance_used": round(balance_used, 9),
                     "valence_readout": round(raw_score, 6),
                     "mbon_rate_hz": round(mbon_rate, 6),
                 }
@@ -1196,7 +1311,7 @@ class AdultRun:
             held = ticker in st.positions
             price = st.last_close[ticker]
             action, reason = _decide(
-                centered,
+                balance_used,
                 held,
                 len(st.positions) + (
                     self._pending_book.n_buys() if self._pending_book is not None else 0
@@ -1255,12 +1370,15 @@ class AdultRun:
                 }
             )
             st.n_deaths += 1
+            # Clear the per-exit snapshots BEFORE liquidation: a dying brain
+            # gets no per-trade credit (loop parity with run_backtest).
+            st.entry_elig.clear()
             for ticker in sorted(st.positions):
                 st.day_realized += self._close_position(ts, ticker, "death_liquidation")
             if self._pending_book is not None:
                 for o in self._pending_book.cancel_all():
                     self._cancel(o, ts, "death")  # the brain that placed them is gone
-            self._plasticity = Plasticity(self._chassis)
+            self._plasticity = Plasticity(self._chassis, top_k=cfg.grudge_top_k)
             self._sim.reset(cfg.seed)
             st.daily_spikes.fill(0)
             st.daily_mbon_drive.fill(0)
@@ -1272,10 +1390,6 @@ class AdultRun:
 
             # A fresh brain re-calibrates its innate balance.
             st.anchor = self._innate(list(frames))
-            # Loop parity note: loop.py emits the hatch event here a second
-            # time (after the anchor re-calibration); mirrored exactly so the
-            # receipts stay shape- and byte-identical across the lifecycle.
-            self._emit({"type": "hatch", "hatch_equity": round(st.hatch_equity, 6)})
             st.equity = st.cash
 
         # 8. Bar receipt.

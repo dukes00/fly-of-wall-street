@@ -1,6 +1,6 @@
 # The Fruit Fly of Wall Street — DESIGN.md
 
-**Version:** 0.4 (2026-09-11)
+**Version:** 0.6 (2026-09-15)
 **Status:** Ideation complete — all decisions settled. Pre-implementation.
 **Tagline:** *166,691 neurons. Zero emotions.*
 
@@ -25,10 +25,10 @@ Best-case outcome (the joke's jackpot): the fly beats the average active fund ma
 
 ## 3. Senses
 
-- **Vision:** candlestick chart rendered at ommatidia resolution → photoreceptor array → optic lobe. T4/T5 direction-selective cells extract price drift; looming-sensitive cells catch vertical spikes (crash/rally detection).
-- **Smell:** indicators mixed as a virtual odor across ~50 glomeruli → mushroom body. Two components (settled, D5):
+- **Vision:** candlestick chart rendered at ommatidia resolution → photoreceptor array → optic lobe. T4/T5 direction-selective cells extract price drift; looming-sensitive cells catch vertical spikes (crash/rally detection). DIRECTION/LOOMING gains recalibrated (v0.6): looming-sensitive LC cells reach nonzero spike yield on crash-like bars (previously 0 spikes in both brains — measured, T12b). T4/T5→KC is 0 synapses (connectome fact) — vision reaches the readout only through the looming→MBON structural path and the smell state vector.
+- **Smell:** indicators mixed as a virtual odor across ~50 glomeruli → mushroom body. Two components (settled, D5; amended 2026-09-15, v0.6):
   - **Identity** — fixed glomerular signature per ticker ("AAPL smells like AAPL").
-  - **State** — market features: returns, RSI, volatility, volume delta.
+  - **State** — market features: returns, RSI, volatility, volume delta, plus multi-bar momentum: `mom20` (20-bar simple return, close[-1]/close[-21]−1) and `slope20` (OLS slope per bar of close over the last 20 bars, relative to price level), both trailing-only. The 1-bar-only state starved the readout of horizon; multi-bar features make the time-ticker signal meaningful. Features are available evidence, not a strategy — the fly may learn momentum, mean-reversion, or neither.
   - Decomposition enables both specific associations ("AAPL = sugar") and general ones ("anything this volatile = shock"). This is what transfers learning across tickers.
 - **Taste (settled, D15 — in v1):** unrealized P&L of the open position, sweet/bitter. The only sense representing what the fly currently owns; enables exit from slow bleed. Also required for the crypto handoff mechanic (§10).
 
@@ -48,12 +48,13 @@ Learning: dopamine-gated plasticity at Kenyon-cell → MBON synapses. One-trial 
 
 - Readout: mushroom body output neurons (MBONs), ~35 cells, approach/avoid balance.
 - Mapping: approach > threshold → BUY/add; avoid > threshold → SELL/skip; neutral → pass.
+- Structural vision drive (v0.6): the looming→MBON path carries real connectome synapses (~152/154); its response enters the decision balance at a small fixed λ (`lambda_struct`, default 0.05): `balance_used = (learned_balance − anchor) + λ_struct × structural_lc_mbon_score`.
 - Position size ← MBON firing rate.
 - Latency: biological reaction ~50–100 ms; sim can clock faster than real time. Intraday scalping is physically legal.
 
 ## 6. Position selection — the foraging loop
 
-1. **Universe: plume-filtered (settled, D3).** No curated watchlist. Each ticker emits a plume with intensity ← price movement. Flat stocks are odorless; the universe self-filters to the day's movers (top-K smelliest of the index).
+1. **Universe: plume-filtered (settled, D3; amended 2026-09-15, v0.6).** No curated watchlist. Each ticker emits a plume with intensity = |20-bar return| × 20 + volume ratio (20-bar movement expressed in 1-bar-equivalent magnitude; volume ratio unchanged). Direction-agnostic — persistent movers of either sign surface. A dead ticker (ret1 = 0 and mom20 = 0) is odorless; the universe self-filters to the day's movers (top-K smelliest of the index).
 2. **Encounter.** One plume at a time, round-robin through the active set. Per encounter: smell (identity × state) + vision (recent chart stream).
 3. **Decision.** MBON approach/avoid as in §5.
 4. **Portfolio** = set of plumes currently approached. Cap **N=10** concurrent positions (settled, D13; per D4 survivability direction). Revocable; calibrate during the larval stage.
@@ -69,6 +70,8 @@ Free behaviors, no code required:
 1. Market opens → fly wakes.
 2. Per 1-minute bar (D16, calibration candidate): render chart → mix odor → step sim → read MBONs → emit paper order.
 3. Close: settle P&L → administer sugar/shock → fly sleeps (consolidation + decay).
+   - Per-exit dopamine (D6; amended 2026-09-15, v0.6; scale amended 2026-09-15, T9): when a position closes with realized P&L r on notional `N = shares × avg_cost`, the eligibility snapshot taken at the opening buy/add is credited with a dopamine gate built from r/N clipped to [-1, 1] (same three-factor rule; reward > 0 potentiates approach-MBON associations of the opening encounter, punishment > 0 the opposite). Trade-level normalization — a trade teaches in proportion to its own outcome; hatch-equity scaling measured ~40x too weak against pessimistic-fill spread costs (t9b gate, 2026-09-15). The close-of-day sugar/shock settle remains the designed diffuse ritual (day realized P&L over hatch equity); per-exit is the precise trade-level credit.
+   - Sleep calibration (T9, v0.6): the innate-balance anchor is refreshed at every sleep (daily re-centering, one extra neutral sniff; deterministic) instead of hatch-only. Grudge protection top_k drops 64 → 16 (config: `grudge_top_k`).
 
 ## 8. Data (free only, hard constraint)
 
@@ -119,10 +122,10 @@ Not a content product (settled, D11). The artifact is the run itself plus its re
 |---|---|---|
 | D1 | 2026-09-11 | Project name: **The Fruit Fly of Wall Street** |
 | D2 | 2026-09-11 | In-fiction fund entity: **Compound Eye Capital** |
-| D3 | 2026-09-11 | Universe: plume-filtered index (emergent attention), no curated watchlist |
+| D3 | 2026-09-11 | Universe: plume-filtered index (emergent attention), no curated watchlist. **Amended 2026-09-15 (v0.6):** plume intensity = \|20-bar return\| × 20 + volume ratio; direction-agnostic; dead ticker (ret1 = 0 ∧ mom20 = 0) odorless |
 | D4 | 2026-09-11 | Position cap: higher N for survivability (exact value → P2) |
-| D5 | 2026-09-11 | Dual sensory channels: vision (candlesticks) + smell (identity × state indicators) |
-| D6 | 2026-09-11 | Stimuli: profit = sugar (PAM), loss = shock (PPL1), hunger = drawdown |
+| D5 | 2026-09-11 | Dual sensory channels: vision (candlesticks) + smell (identity × state indicators). **Amended 2026-09-15 (v0.6):** state vector gains multi-bar momentum — mom20 (20-bar simple return) and slope20 (OLS slope/20 bars, price-relative), trailing-only |
+| D6 | 2026-09-11 | Stimuli: profit = sugar (PAM), loss = shock (PPL1), hunger = drawdown. **Amended 2026-09-15 (v0.6):** per-exit dopamine added — closing a position credits the opening encounter's eligibility snapshot from realized P&L; daily sugar/shock settle remains the diffuse ritual |
 | D7 | 2026-09-11 | Intraday operation; fly sleeps in aftermarket |
 | D8 | 2026-09-11 | Free data only — no paid feeds |
 | D9 | 2026-09-11 | Crypto shift pair (Wall & Street) parked as alternative; provisional handoff = taste channel |
@@ -151,6 +154,7 @@ Empty as of v0.3 — P2–P9 all settled (D12–D19). New open questions land he
 - **v0.3 (2026-09-11):** All parking-lot items settled: US equities (D12), N=10 (D13), death at −50% equity (D14), taste in v1 (D15), 1-min bars (D16), single fly (D17), live local dashboard over PDF (D18), transplant = copy + validate ≥90% (D19, revocable, my call on Duke's defer). Ideation complete. Next phase: implementation planning.
 - **v0.4 (2026-09-11):** D20: target hardware — MacBook Pro M1; Raspberry Pi clause removed (§13). D21: dashboard stack — FastAPI + SSE + vanilla canvas, file-interface, no build step (§13). Implementation plan written: plan/TASKS.md v0.2 (15 tasks, larval harness first).
 - **v0.5 (2026-09-14):** D22 — whole-fly is the live brain, trained directly; transplant (D19) dropped; STD added to the LIF engine (§2 rewritten). Implementation status: all 15 tasks of plan/TASKS.md v0.1 complete (M1–M4), plus the APL/STD revision. Extended IEX 1-min history acquisition for held-out evaluation in progress.
+- **v0.6 (2026-09-15):** Duke stopped both trainings after the no-look-ahead audit + offline regressions showed the decision variable carried ~zero forward-return signal (r ≈ 0.003–0.02) and pass rates ratcheted 94 → 98%. Root cause: momentum/horizon information dies between vision and the readout (sub-threshold gains, 0 T4/T5/LC→KC synapses, readout excludes structural input) and credit assignment pools a day under one dopamine scalar. Ratified package: multi-bar state features (§3), per-exit dopamine (§7.3), widened plume ranker (§6.1), daily anchor refresh + grudge top-k 16 (§7.3), looming gain fix + λ structural drive (§3/§5). Emergence principle: the fly may learn momentum, mean-reversion, or neither — the umwelt no longer forbids it.
 
 ---
 

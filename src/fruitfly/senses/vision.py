@@ -54,9 +54,17 @@ GRID_W = 48
 GRID_H = 24
 
 #: Current (LIFSim input units) per unit normalized drift, at full kernel weight.
-DIRECTION_GAIN = 30.0
-#: Current at full looming saturation (expansion == 1).
-LOOMING_GAIN = 40.0
+#: Measured (throwaway probe, 2026-09-15): on a synthetic crash tape whose
+#: last bar's range is 3x the quiet bars' (expansion 0.20, window-normalized),
+#: the old gains (30/40) left T4/T5 AND LC-looming at 0 spikes in a 500 ms
+#: encounter; DIRECTION_GAIN=120 yields ~2.5k spikes over 95 T4/T5 cells —
+#: the smallest probed candidate (120/180/240) with nonzero yield.
+DIRECTION_GAIN = 120.0
+#: Current at full looming saturation (expansion == 1). Measured on the same
+#: probe tape: LOOMING_GAIN=40 and 80 give 0 LC spikes (expansion - threshold
+#: current never clears the 15 mV LIF threshold); 160 is the smallest probed
+#: candidate (160/240/320) with nonzero yield (~538 spikes over 57 LC cells).
+LOOMING_GAIN = 160.0
 
 _BODY_COLS = ("open", "high", "low", "close")
 

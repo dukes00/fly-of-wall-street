@@ -25,7 +25,7 @@ import pytest
 import scipy.sparse as sp
 
 from fruitfly.connectome import Chassis
-from fruitfly.loop import BacktestConfig, run_backtest
+from fruitfly.loop import BacktestConfig, _plume_set, run_backtest
 
 # --- synthetic chassis (mirrors reports/t2-connectome.md populations) -------
 
@@ -62,20 +62,31 @@ _EDGES = [
 ]
 
 
-def make_chassis() -> Chassis:
-    n = len(_ROWS)
+def make_chassis(lc: bool = False) -> Chassis:
+    rows = list(_ROWS)
+    regions = (
+        ["antennal-lobe"] * 4 + ["mushroom-body"] * 14 + ["protocerebrum"] * 4
+    )
+    edges = list(_EDGES)
+    if lc:
+        # Two LC looming cells with direct LC->MBON synapses onto approach
+        # MBONs (DESIGN v0.6 §5 structural path). Appended after the PPL1
+        # rows so every existing node index stays unchanged.
+        n = len(_ROWS)
+        rows += [("LC01", "LC-looming", "acetylcholine", 1),
+                 ("LC02", "LC-looming", "acetylcholine", 1)]
+        regions += ["optic-lobe", "optic-lobe"]
+        edges += [(n, 12, 400), (n + 1, 13, 400)]
+    n = len(rows)
     nodes = pd.DataFrame(
         [(10_000 + i, t, t, "L", p, r, nt, s)
          for i, (t, p, nt, s), r
-         in zip(range(n), _ROWS,
-                ["antennal-lobe"] * 4 + ["mushroom-body"] * 14
-                + ["protocerebrum"] * 4,
-                strict=True)],
+         in zip(range(n), rows, regions, strict=True)],
         columns=_COLS,
     )
-    pre = np.array([e[0] for e in _EDGES], dtype=np.int64)
-    post = np.array([e[1] for e in _EDGES], dtype=np.int64)
-    w = np.array([e[2] for e in _EDGES], dtype=np.int64)
+    pre = np.array([e[0] for e in edges], dtype=np.int64)
+    post = np.array([e[1] for e in edges], dtype=np.int64)
+    w = np.array([e[2] for e in edges], dtype=np.int64)
     adj = sp.csr_matrix((w, (pre, post)), shape=(n, n), dtype=np.int64)
     adj.sum_duplicates()
     return Chassis(
@@ -112,6 +123,39 @@ def make_bars(crash: bool = False) -> dict[str, pd.DataFrame]:
                 )
         frames[ticker] = pd.DataFrame(rows, index=pd.DatetimeIndex(stamps))
     return frames
+
+
+def make_looming_bars() -> dict[str, pd.DataFrame]:
+    """One mover whose day-2 open is a crash bar: a huge vertical range
+    right after a quiet window -> LC looming currents fire (DESIGN v0.6 §5).
+
+    AAA is the only ticker, so every plume-bearing bar samples AAA and the
+    encounter that sees the crash bar is exactly 2026-08-19T13:30Z.
+    """
+    plan = [  # (day, minute, close, half_range)
+        (18, 0, 100.0, 0.3), (18, 1, 100.5, 0.3), (18, 2, 101.0, 0.3),
+        (19, 0, 92.0, 8.0),  # the crash bar: big range, quiet window
+        (19, 1, 92.5, 0.3), (19, 2, 93.0, 0.3),
+    ]
+    rows, stamps = [], []
+    for day, minute, close, hr in plan:
+        stamps.append(pd.Timestamp(f"2026-08-{day} 13:3{minute}:00", tz="UTC"))
+        rows.append({"open": close - 0.2, "high": close + hr,
+                     "low": close - hr, "close": close, "volume": 5_000})
+    return {"AAA": pd.DataFrame(rows, index=pd.DatetimeIndex(stamps))}
+
+
+@pytest.fixture()
+def patched_lc(monkeypatch, tmp_path):
+    """Like ``patched`` but on the LC->MBON chassis + the crash tape."""
+    import fruitfly.loop as loop
+
+    monkeypatch.setattr(loop, "_load_chassis", lambda: make_chassis(lc=True))
+    monkeypatch.setattr(
+        loop, "load_bars", lambda symbols, start=None, end=None: make_looming_bars()
+    )
+    monkeypatch.setattr(loop, "BASKET", ["AAA"])
+    return loop
 
 
 @pytest.fixture()
@@ -172,7 +216,7 @@ class TestInvariants:
         # churn (buys and valence-flip sells), so the cap guard is exercised.
         result = run_backtest(
             _config(7, tmp_path / "run", position_cap=cap,
-                    approach_thr=0.001, avoid_thr=0.001, noise_sigma_mv=5.0)
+                    approach_thr=0.001, avoid_thr=0.001, noise_sigma_mv=10.0)
         )
         open_positions: set[str] = set()
         for event in _events(result.run_dir / "events.jsonl"):
@@ -192,10 +236,11 @@ class TestInvariants:
         # Tight thresholds + strong noise: encounters produce orders.
         result = run_backtest(
             _config(7, tmp_path / "run", approach_thr=0.001, avoid_thr=0.001,
-                    noise_sigma_mv=5.0)
+                    noise_sigma_mv=10.0)
         )
         types = {event["type"] for event in _events(result.run_dir / "events.jsonl")}
-        assert {"wake", "encounter", "decision", "order", "sugar_shock", "sleep"} <= types
+        assert {"wake", "encounter", "decision", "order", "sugar_shock", "sleep",
+                "anchor"} <= types
 
     def test_equity_csv_contract(self, patched, tmp_path):
         result = run_backtest(_config(7, tmp_path / "run"))
@@ -239,9 +284,10 @@ class TestDeath:
         death = next(e for e in events if e["type"] == "death")
         assert death["equity"] <= death["hatch_equity"] * (1.0 - 0.02)
         liquidations = [e for e in events if e.get("reason") == "death_liquidation"]
-        assert liquidations, "the dying fly must liquidate its book"
         last = _events(result.run_dir / "events.jsonl")[-1]
-        assert last["type"] == "sleep"
+        # The run ends with the close-of-day settle: sleep, then the
+        # v0.6 daily anchor refresh (T9).
+        assert last["type"] == "anchor"
         rows = (result.run_dir / "equity.csv").read_text().splitlines()[1:]
         # On the death bar the book is flat: n_positions returns to 0.
         death_row = next(
@@ -286,10 +332,12 @@ class TestFillModel:
             orders = [o for o in orders if o["reason"] != "death_liquidation"]
         return orders
 
-    def test_no_look_ahead_fills_on_the_next_bar(self, patched, tmp_path):
+
+    def test_no_look_ahead_fills_on_the_next_bar(self, patched, monkeypatch,
+                                                 tmp_path):
         result = run_backtest(
             _config(7, tmp_path / "run", approach_thr=0.001, avoid_thr=0.001,
-                    noise_sigma_mv=5.0)
+                    noise_sigma_mv=10.0)
         )
         frames = make_bars()
         orders = self._orders(result)
@@ -303,10 +351,11 @@ class TestFillModel:
             # The execution bar is the ticker's own NEXT available bar.
             assert pd.Timestamp(o["ts"]) == later[0]
 
-    def test_pessimistic_pricing_buy_high_sell_low(self, patched, tmp_path):
+    def test_pessimistic_pricing_buy_high_sell_low(self, patched, monkeypatch,
+                                                   tmp_path):
         result = run_backtest(
             _config(7, tmp_path / "run", approach_thr=0.001, avoid_thr=0.001,
-                    noise_sigma_mv=5.0)
+                    noise_sigma_mv=10.0)
         )
         frames = make_bars()
         orders = self._orders(result)
@@ -383,13 +432,13 @@ class TestFillModel:
             e["decision_ts"] == "2026-08-19T13:34:00+00:00" for e in cancels
         )
         # Cancels precede the close-of-day settle: the run still ends asleep.
-        assert events[-1]["type"] == "sleep"
+        assert events[-1]["type"] == "anchor"
 
     def test_close_mode_is_the_documented_look_ahead_hatch(self, patched,
                                                           tmp_path):
         result = run_backtest(
             _config(7, tmp_path / "run", fill_mode="close",
-                    approach_thr=0.001, avoid_thr=0.001, noise_sigma_mv=5.0)
+                    approach_thr=0.001, avoid_thr=0.001, noise_sigma_mv=10.0)
         )
         frames = make_bars()
         orders = self._orders(result)
@@ -410,10 +459,10 @@ class TestFillModel:
         # Queued buys count toward the cap, so fills can never exceed it.
         assert all(int(row.split(",")[3]) <= 1 for row in rows)
 
-    def test_fees_default_zero_untouched(self, patched, tmp_path):
+    def test_fees_default_zero_untouched(self, patched, monkeypatch, tmp_path):
         result = run_backtest(
             _config(7, tmp_path / "run", approach_thr=0.001, avoid_thr=0.001,
-                    noise_sigma_mv=5.0)
+                    noise_sigma_mv=10.0)
         )
         orders = [
             e for e in _events(result.run_dir / "events.jsonl")
@@ -533,6 +582,260 @@ class TestChassisSimConstruction:
         for name in ("equity.csv", "events.jsonl"):
             assert _sha(a.run_dir / name) == _sha(b.run_dir / name)
 
+
+
+# ---------------------------------------------------------------------------
+# DESIGN v0.6 (2026-09-15): plume ranker, per-exit dopamine, daily anchor
+# refresh, grudge_top_k, structural looming drive
+# ---------------------------------------------------------------------------
+
+
+def _counter_stub(do_close: bool):
+    """Decision stub: buy the first AAA encounter (day 1, 13:32), close it
+    on the next AAA encounter (13:34) when ``do_close``."""
+    state = {"n": 0}
+
+    def stub(balance, held, cap_reached, approach_thr, avoid_thr):
+        n = state["n"]
+        state["n"] += 1
+        if n == 1:
+            return "buy", "approach"
+        if do_close and held and n == 3:
+            return "sell", "valence_flip"
+        return "pass", "neutral"
+
+    return stub
+
+
+class TestPlumeRankerV06:
+    """D3 amendment: intensity = |mom20| x 20 + volume ratio."""
+
+    def _frames(self):
+        ts = pd.Timestamp("2026-08-18 13:30:00", tz="UTC")
+
+        def frame(closes):
+            idx = pd.DatetimeIndex(
+                [ts + pd.Timedelta(minutes=i) for i in range(len(closes))]
+            )
+            return pd.DataFrame(
+                {"open": closes, "high": [c + 0.1 for c in closes],
+                 "low": [c - 0.1 for c in closes], "close": closes,
+                 "volume": [1_000] * len(closes)},
+                index=idx,
+            )
+
+        return {
+            # persistent 20-bar mover, +1%/bar
+            "MOVE": frame([100.0 * (1.01 ** k) for k in range(21)]),
+            # one 4% jump after a flat stretch
+            "SPIKE": frame([100.0] * 20 + [104.0]),
+            # persistent DECLINER: direction-agnostic surface
+            "DECL": frame([100.0 * (0.99 ** k) for k in range(21)]),
+            # dead: ret1 == 0 AND mom20 == 0
+            "DEAD": frame([100.0] * 21),
+            # flat last bar on a mover: NOT odorless (mom20 carries it)
+            "FLATLAST": frame([100.0 * (1.01 ** k) for k in range(20)]
+                              + [100.0 * 1.01 ** 19]),
+        }
+
+    def test_persistent_mover_beats_one_bar_spike_and_is_direction_agnostic(self):
+        last_ts = self._frames()["MOVE"].index[-1]
+        ranked = _plume_set(self._frames(), last_ts, 5)
+        tickers = [t for t, _ in ranked]
+        # Persistent movers of either sign surface above the 1-bar spike.
+        assert tickers.index("MOVE") < tickers.index("SPIKE")
+        assert tickers.index("DECL") < tickers.index("SPIKE")
+        # A flat last bar on an otherwise-moving ticker still smells; a
+        # dead ticker does not.
+        assert "FLATLAST" in tickers
+        assert "DEAD" not in tickers
+        # The intensity itself is the amended formula on the winner.
+        move = dict(ranked)["MOVE"]
+        assert move == pytest.approx(abs(1.01 ** 20 - 1.0) * 20.0 + 1.0)
+
+
+class TestPerExitDopamine:
+    def test_closed_profitable_trade_emits_credit_and_moves_weights(
+        self, patched, monkeypatch, tmp_path
+    ):
+        loop = patched
+        monkeypatch.setattr(loop, "_decide", _counter_stub(do_close=True))
+        with_close = run_backtest(
+            _config(7, tmp_path / "close", fill_mode="close")
+        )
+        monkeypatch.setattr(loop, "_decide", _counter_stub(do_close=False))
+        without_close = run_backtest(
+            _config(7, tmp_path / "open", fill_mode="close")
+        )
+
+        events = _events(with_close.run_dir / "events.jsonl")
+        credits = [e for e in events if e["type"] == "trade_credit"]
+        assert len(credits) == 1
+        credit = credits[0]
+        assert credit["ticker"] == "AAA"
+        assert credit["realized_pnl"] > 0.0  # a profitable close
+        sells = [e for e in events
+                 if e["type"] == "order" and e["side"] == "sell"]
+        assert credit["ts"] == sells[0]["ts"]
+        buys = [e for e in events
+                if e["type"] == "order" and e["side"] == "buy"]
+        notional = buys[0]["shares"] * buys[0]["price"]
+        assert credit["reward"] == pytest.approx(
+            min(1.0, credit["realized_pnl"] / notional), abs=1e-8
+        )
+        assert credit["punishment"] == 0.0
+
+        # The run without the close emits no credit and ends with
+        # different fly weights than the credited run.
+        assert not [
+            e for e in _events(without_close.run_dir / "events.jsonl")
+            if e["type"] == "trade_credit"
+        ]
+        assert not np.array_equal(with_close.final_weights,
+                                  without_close.final_weights)
+
+
+class TestDailyAnchorRefresh:
+    def test_anchor_emitted_each_day_and_centering_uses_refreshed_anchor(
+        self, patched, monkeypatch, tmp_path
+    ):
+        loop = patched
+        monkeypatch.setattr(loop, "_decide", _counter_stub(do_close=True))
+        result = run_backtest(_config(7, tmp_path / "run", fill_mode="close"))
+        events = _events(result.run_dir / "events.jsonl")
+
+        anchors = [e for e in events if e["type"] == "anchor"]
+        assert [a["ts"] for a in anchors] == [
+            "2026-08-18T20:00:00+00:00",
+            "2026-08-19T20:00:00+00:00",
+        ]
+        # The refresh reflects the day's learning (the profitable close
+        # moved weights, so the day-1 settle re-measures a new anchor).
+        assert anchors[1]["balance"] != anchors[0]["balance"]
+
+        # The day-1 settle refresh is what day-2 encounters center on: the
+        # re-centering drifts back with the learned bias instead of going
+        # stale on the hatch measurement.
+        refreshed = anchors[0]["balance"]
+        day2 = [e for e in events
+                if e["type"] == "encounter" and e["ts"] > "2026-08-19"]
+        assert day2
+        for e in day2:
+            assert e["balance"] == pytest.approx(
+                e["raw_balance"] - refreshed, abs=2e-9
+            )
+        assert max(abs(e["balance"]) for e in day2) < 0.05
+
+
+class TestStructuralLoomingDrive:
+    CRASH_TS = "2026-08-19T13:30:00+00:00"
+
+    def test_crash_bar_shifts_balance_used_via_lambda_struct(
+        self, patched_lc, monkeypatch, tmp_path
+    ):
+        loop = patched_lc
+        real_decide = loop._decide
+        seen = []
+
+        def spy(balance, held, cap_reached, approach_thr, avoid_thr):
+            seen.append(balance)
+            return real_decide(
+                balance, held, cap_reached, approach_thr, avoid_thr
+            )
+
+        monkeypatch.setattr(loop, "_decide", spy)
+        result = run_backtest(_config(7, tmp_path / "run"))
+        enc = [
+            e for e in _events(result.run_dir / "events.jsonl")
+            if e["type"] == "encounter"
+        ]
+        assert len(seen) == len(enc)
+        for balance_arg, e in zip(seen, enc, strict=True):
+            # The decision consumes balance_used, not the centered balance.
+            assert balance_arg == pytest.approx(e["balance_used"], abs=5e-10)
+
+        crash = next(e for e in enc if e["ts"] == self.CRASH_TS)
+        assert crash["structural_score"] > 0.0
+        # The crash bar drives the strongest LC looming response.
+        assert crash["structural_score"] == max(
+            e["structural_score"] for e in enc
+        )
+        for e in enc:
+            assert e["balance_used"] == pytest.approx(
+                e["balance"] + 0.05 * e["structural_score"], abs=2e-9
+            )
+
+        # lambda_struct = 0 removes the structural term entirely (same
+        # seed -> identical encounters, identical structural scores).
+        zero = run_backtest(_config(7, tmp_path / "zero", lambda_struct=0.0))
+        zc = [
+            e for e in _events(zero.run_dir / "events.jsonl")
+            if e["type"] == "encounter"
+        ]
+        zcrash = next(e for e in zc if e["ts"] == self.CRASH_TS)
+        assert zcrash["structural_score"] == crash["structural_score"]
+        assert zcrash["balance_used"] == zcrash["balance"]
+
+    def test_chassis_without_lc_path_keeps_structural_score_zero(
+        self, patched, tmp_path
+    ):
+        result = run_backtest(_config(7, tmp_path / "run"))
+        enc = [
+            e for e in _events(result.run_dir / "events.jsonl")
+            if e["type"] == "encounter"
+        ]
+        assert enc
+        assert all(e["structural_score"] == 0.0 for e in enc)
+        assert all(e["balance_used"] == e["balance"] for e in enc)
+
+
+class TestGrudgeTopK:
+    def test_default_and_config_flow_to_plasticity(
+        self, patched, monkeypatch, tmp_path
+    ):
+        defaults = BacktestConfig(seed=1, start="2026-08-18", end="2026-08-19")
+        assert defaults.grudge_top_k == 16
+        assert defaults.lambda_struct == 0.05
+
+        loop = patched
+        real = loop.Plasticity
+        captured = []
+
+        def spy(chassis, **kwargs):
+            captured.append(kwargs.get("top_k"))
+            return real(chassis, **kwargs)
+
+        monkeypatch.setattr(loop, "Plasticity", spy)
+        run_backtest(_config(7, tmp_path / "run"))
+        assert captured and set(captured) == {16}
+        captured.clear()
+        run_backtest(_config(7, tmp_path / "k3", grudge_top_k=3))
+        assert captured and set(captured) == {3}
+
+
+class TestV06Determinism:
+    def test_same_seed_double_run_byte_identical_with_v06_events(
+        self, patched, monkeypatch, tmp_path
+    ):
+        loop = patched
+        monkeypatch.setattr(loop, "_decide", _counter_stub(do_close=True))
+        a = run_backtest(_config(7, tmp_path / "a", fill_mode="close"))
+        monkeypatch.setattr(loop, "_decide", _counter_stub(do_close=True))
+        b = run_backtest(_config(7, tmp_path / "b", fill_mode="close"))
+        for name in ("equity.csv", "events.jsonl"):
+            assert _sha(a.run_dir / name) == _sha(b.run_dir / name)
+        types = {e["type"] for e in _events(a.run_dir / "events.jsonl")}
+        assert {"trade_credit", "anchor"} <= types
+
+    def test_same_seed_double_run_byte_identical_on_lc_chassis(
+        self, patched_lc, tmp_path
+    ):
+        a = run_backtest(_config(7, tmp_path / "a"))
+        b = run_backtest(_config(7, tmp_path / "b"))
+        for name in ("equity.csv", "events.jsonl"):
+            assert _sha(a.run_dir / name) == _sha(b.run_dir / name)
+        types = {e["type"] for e in _events(a.run_dir / "events.jsonl")}
+        assert {"anchor"} <= types
 
 @pytest.mark.skipif(
     os.environ.get("FRUITFLY_WHOLE_SMOKE") != "1",

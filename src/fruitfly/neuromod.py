@@ -239,6 +239,39 @@ class Plasticity:
                 self.min_habituation, self.habituation_decay * self._habituation[x > 0.0]
             )
 
+    def observe_trade(
+        self, state: NeuromodState, eligibility_snapshot: np.ndarray
+    ) -> None:
+        """Precise per-exit credit assignment (DESIGN §7.3, D6).
+
+        The caller snapshots ``eligibility`` at the opening buy/add of a
+        position and calls this at the close with a ``state`` built from the
+        trade's realized P&L. Applies the SAME three-factor update as
+        ``observe`` but with the snapshot as the trace — the dopamine gate
+        credits the *opening* encounter, not whatever co-activity happened
+        since. WITHOUT advancing the live eligibility trace or touching
+        habituation: the snapshot is consumed, the ongoing perception is not.
+
+        The diffuse daily ``observe`` at close-of-day (day realized P&L under
+        one gate) remains the DESIGNED ritual; this is the precise
+        trade-level complement. Both are bounded by the same gate scale.
+
+        Deterministic: float64, no RNG, fixed op order.
+        """
+        snapshot = np.asarray(eligibility_snapshot, dtype=np.float64)
+        if snapshot.shape != self._eligibility.shape:
+            raise ValueError(
+                "eligibility_snapshot must match the eligibility trace "
+                f"(shape {self._eligibility.shape}), got {snapshot.shape}"
+            )
+        d = self._gate(state)
+        if abs(d) > 0.0:
+            # Three-factor update: gate × snapshot × MBON valence.
+            delta = (self.learning_rate * d) * (snapshot * self.mbon_valence[None, :])
+            delta *= self.support
+            self._weights += delta
+            np.clip(self._weights, 0.0, None, out=self._weights)  # synapses ≥ 0
+
     # ------------------------------------------------------------------ sleep
     def sleep(self) -> None:
         """Consolidation + regime forgetting (DESIGN §4, D7).

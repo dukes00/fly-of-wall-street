@@ -306,6 +306,47 @@ def test_kc_activity_slices_kc_rows(chassis):
     assert x.tolist() == [0.0, 2.0, 0.0, 0.0]  # MBON input ignored, KC rows only
 
 
+# --- per-exit credit assignment (observe_trade) ---------------------------------
+
+
+def test_observe_trade_matches_observe_on_same_trace(chassis):
+    """Reward-gated snapshot credit equals what observe does on the same trace."""
+    trade = Plasticity(chassis, learning_rate=2.0)
+    pre, post = spikes({KC0: 1.0, KC1: 2.0}), spikes({MBON0: 1.0, MBON2: 3.0})
+    trade.observe(NeuromodState(), pre, post)
+    snapshot = trade.eligibility.copy()
+    # Reference: the same co-activity driven through observe with the reward
+    # gate fired in that same step, so its live trace equals the snapshot.
+    ref = Plasticity(chassis, learning_rate=2.0)
+    reward_state = NeuromodState(reward=1.0, arousal=0.5)
+    ref.observe(reward_state, pre, post)
+    trade.observe_trade(reward_state, snapshot)
+    # Same gate × same trace × same valence rule → identical weights.
+    assert trade.weights.tobytes() == ref.weights.tobytes()
+    assert trade.weights[0, 0] > W00  # approach potentiated
+    assert trade.weights[0, 2] < W02  # avoid depressed
+
+
+def test_observe_trade_leaves_live_state_untouched(chassis):
+    trade = Plasticity(chassis, learning_rate=2.0)
+    trade.observe(NeuromodState(), spikes({KC0: 1.0}), spikes({MBON0: 1.0}))
+    live_elig = trade.eligibility.copy()
+    live_hab = trade.habituation.copy()
+    weights_before = trade.weights.copy()
+    trade.observe_trade(NeuromodState(), trade.eligibility.copy())  # zero gate → no-op
+    trade.observe_trade(NeuromodState(reward=1.0), np.zeros_like(trade.eligibility))
+    assert np.array_equal(trade.eligibility, live_elig)
+    assert np.array_equal(trade.habituation, live_hab)
+    assert np.array_equal(trade.weights, weights_before)  # zero trace → no delta
+
+
+def test_observe_trade_validates_snapshot_shape(chassis):
+    trade = Plasticity(chassis)
+    with pytest.raises(ValueError, match="eligibility_snapshot"):
+        trade.observe_trade(NeuromodState(), np.zeros((3, 3)))
+
+
+
 # --- determinism (byte-identical double run) ------------------------------------
 
 

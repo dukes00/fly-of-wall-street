@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from fruitfly.senses import (
@@ -21,6 +22,9 @@ from fruitfly.senses import (
     encode_vision,
     identity_profile,
 )
+from fruitfly.senses.smell import FEATURE_NEUTRAL, build_features
+from fruitfly.senses.vision import LOOMING_GAIN
+from fruitfly.sim import LIFSim
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 import charts  # noqa: E402
@@ -65,7 +69,7 @@ def test_vision_looming_fires_on_crash_silent_on_flat(chassis, pop):
     crash = encode_vision(charts.chart_crash(), chassis)[lc]
     assert np.all(flat == 0.0)  # silent on flat
     assert np.all(crash > 0.0)  # every LC cell above its threshold fires
-    assert crash.max() > 0.5 * 40.0  # strongly fired, near saturation
+    assert crash.max() > 0.5 * LOOMING_GAIN  # strongly fired, near saturation
 
 
 def test_vision_deterministic(chassis):
@@ -81,6 +85,39 @@ def test_vision_rejects_bad_windows(chassis):
         encode_vision(charts.chart_flat().iloc[:0], chassis)
 
 
+def _crash_tape_3x() -> pd.DataFrame:
+    """Quiet oscillating band; the last bar's range is 3x the quiet bars'.
+
+    Window-normalized expansion lands at a realistic ~0.2 (r_last 0.3 vs
+    r_earlier 0.1) — the regime where the pre-T12b gains left LC silent.
+    """
+    rows = []
+    for i in range(47):
+        mid = 104.5 + 4.5 * np.sin(2.0 * np.pi * i / 12.0)
+        rows.append((mid - 0.25, mid + 0.5, mid - 0.5, mid + 0.25))
+    rows.append((105.0, 105.0, 102.0, 102.2))  # crash bar: range 3.0 vs quiet 1.0
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+
+
+def test_vision_lc_spike_yield_on_crash_tape(chassis, pop):
+    """T12b regression: on a crash-like bar (3x range expansion) looming LC
+    cells must actually SPIKE within a 500 ms encounter, not merely receive
+    sub-threshold current. Measured at the old gains (30/40): 0 spikes."""
+    from fruitfly.senses import vision as vision_mod
+
+    drift, rng = vision_mod._per_column_signals(_crash_tape_3x())
+    expansion = float(rng[-1]) - float(rng[:-1].mean())
+    assert 0.0 < expansion < 0.5  # realistic 3x expansion, not a degenerate spike
+
+    lc = pop == "LC-looming"
+    inp = encode_vision(_crash_tape_3x(), chassis)
+    spikes = LIFSim(chassis).step(inp, 500.0)["spikes"]
+    assert int(spikes[lc].sum()) > 0
+
+    # Gentle drift stays LC-silent: uniform ranges give exactly zero expansion.
+    assert np.all(encode_vision(charts.chart_up(), chassis)[lc] == 0.0)
+
+
 def test_vision_long_window_uses_last_48_bars(chassis):
     long = charts.chart_up(n_bars=200)
     assert np.array_equal(
@@ -93,7 +130,14 @@ def test_vision_long_window_uses_last_48_bars(chassis):
 
 _TICKERS = ["AAPL", "MSFT", "GOOG", "TSLA", "NVDA", "AMZN", "META", "AMD", "NFLX", "SPY"]
 
-_NEUTRAL = {"returns": 0.0, "rsi": 50.0, "volatility": 0.0, "volume_delta": 0.0}
+_NEUTRAL = {
+    "returns": 0.0,
+    "rsi": 50.0,
+    "volatility": 0.0,
+    "volume_delta": 0.0,
+    "mom20": 0.0,
+    "slope20": 0.0,
+}
 
 
 def test_smell_dims_exact(chassis):
@@ -122,7 +166,8 @@ def test_smell_identity_constant_per_ticker_distinct_across(chassis):
 def test_smell_state_modulates(chassis):
     base = encode_smell("AAPL", _NEUTRAL, chassis)
     hot = encode_smell(
-        "AAPL", {"returns": 0.05, "rsi": 80.0, "volatility": 0.03, "volume_delta": 0.4},
+        "AAPL", {"returns": 0.05, "rsi": 80.0, "volatility": 0.03,
+                 "volume_delta": 0.4, "mom20": 0.1, "slope20": 0.002},
         chassis,
     )
     assert not np.array_equal(base, hot)
@@ -131,6 +176,51 @@ def test_smell_state_modulates(chassis):
         encode_smell("AAPL", {"volatility": 0.03}, chassis),
         encode_smell("AAPL", {**_NEUTRAL, "volatility": 0.03}, chassis),
     )
+
+
+
+
+def test_build_features_mom20_slope20_exact():
+    # 21-bar geometric ramp: mom20 must reach close[-21] (= index 0), so the
+    # window is 21 bars — an off-by-one would use close[-20] instead.
+    closes = [100.0 * 1.01**i for i in range(21)]
+    feats = build_features(pd.DataFrame({"close": closes, "volume": [1_000.0] * 21}))
+    assert feats["mom20"] == closes[-1] / closes[0] - 1.0
+    assert feats["mom20"] == pytest.approx(1.01**20 - 1.0)
+    # 20-bar linear ramp: relative OLS slope = 1 per bar over mean 110.5.
+    lin = [100.0 + float(i) for i in range(21)]
+    f2 = build_features(pd.DataFrame({"close": lin, "volume": [1_000.0] * 21}))
+    window = np.asarray(lin[-20:])
+    assert f2["slope20"] == float(np.polyfit(np.arange(20), window, 1)[0] / window.mean())
+
+
+def test_build_features_mom20_slope20_warmup_neutral():
+    lin = [100.0 + float(i) for i in range(20)]
+    feats = build_features(pd.DataFrame({"close": lin, "volume": [1_000.0] * 20}))
+    assert feats["mom20"] == FEATURE_NEUTRAL["mom20"]  # mom20 needs 21 bars
+    window = np.asarray(lin[-20:])
+    assert feats["slope20"] == float(np.polyfit(np.arange(20), window, 1)[0] / window.mean())
+
+
+def test_build_features_trailing_only():
+    """No look-ahead: every feature's window fits in the trailing 21 bars,
+    so a 30-bar frame and its last-21 slice must agree exactly."""
+    rng = np.random.default_rng(7)
+    close = 100.0 * np.cumprod(1.0 + rng.normal(0.0, 0.01, 30))
+    volume = rng.uniform(1_000.0, 2_000.0, 30)
+    df = pd.DataFrame({"close": close, "volume": volume})
+    assert build_features(df) == build_features(df.iloc[-21:])
+
+
+def test_smell_new_features_flow_through(chassis):
+    """mom20/slope20 modulate the identity like the other features; the
+    encode_smell output dim is unchanged (391)."""
+    base = encode_smell("AAPL", _NEUTRAL, chassis)
+    hot = encode_smell("AAPL", {**_NEUTRAL, "mom20": 0.15, "slope20": 0.003}, chassis)
+    assert hot.shape == (391,)
+    assert not np.array_equal(base, hot)
+    assert not np.array_equal(base, encode_smell("AAPL", {**_NEUTRAL, "mom20": 0.15}, chassis))
+    assert not np.array_equal(base, encode_smell("AAPL", {**_NEUTRAL, "slope20": 0.003}, chassis))
 
 
 def test_smell_glomerulus_mapping_covers_all_channels(chassis, pop):

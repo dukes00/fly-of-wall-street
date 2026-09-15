@@ -185,15 +185,49 @@ class TestParity:
         types_a = [e["type"] for e in _events(adult_result.run_dir / "events.jsonl")]
         types_b = [e["type"] for e in _events(bt_result.run_dir / "events.jsonl")]
         assert types_a == types_b
-        assert types_a[0] == "hatch" and types_a[-1] == "sleep"
+        assert types_a[0] == "hatch" and types_a[-1] == "anchor"  # v0.6 daily refresh
         for expected in ("wake", "encounter", "decision", "order", "sugar_shock"):
             assert expected in types_a
+        # v0.6: every encounter receipt carries the structural looming drive.
+        enc = next(e for e in _events(adult_result.run_dir / "events.jsonl")
+                   if e["type"] == "encounter")
+        assert set(enc) >= {"structural_score", "balance_used", "raw_balance"}
+        # Anchor refresh runs at every settle; last event of the run is one.
+        anchors = [e for e in types_a if e == "anchor"]
+        assert len(anchors) == 2  # two sessions -> two settles
 
     def test_receipts_have_the_shared_shape(self, patched, tmp_path):
         cfg = _config(tmp_path / "run")
         AdultRun(cfg).run()
         header = (cfg.run_directory() / "equity.csv").read_text().splitlines()[0]
         assert header == "timestamp,equity,cash,n_positions"
+
+    def test_trade_credit_credits_opening_snapshot(self, patched, monkeypatch, tmp_path):
+        """A realized sell emits a ``trade_credit`` built from the opening
+        fill's eligibility snapshot (DESIGN v0.6 D6)."""
+        import fruitfly.adult as adult
+
+        def buy_then_sell(balance, held, cap_reached, approach_thr, avoid_thr):
+            return ("sell", "avoid") if held else ("buy", "approach")
+
+        monkeypatch.setattr(adult, "_decide", buy_then_sell)
+        cfg = _config(tmp_path / "tc")
+        AdultRun(cfg).run()
+        events = _events(cfg.run_directory() / "events.jsonl")
+        credits = [e for e in events if e["type"] == "trade_credit"]
+        assert credits, "a buy-then-sell fly must emit a trade_credit"
+        credit = credits[0]
+        sells = [e for e in events if e["type"] == "order" and e["side"] == "sell"]
+        assert credit["ts"] == sells[0]["ts"]
+        assert credit["realized_pnl"] == sells[0]["realized_pnl"]
+        buys = [e for e in events if e["type"] == "order" and e["side"] == "buy"]
+        notional = buys[0]["shares"] * buys[0]["price"]
+        assert credit["reward"] == round(
+            min(1.0, max(0.0, credit["realized_pnl"]) / notional), 9
+        )
+        assert credit["punishment"] == round(
+            min(1.0, max(0.0, -credit["realized_pnl"]) / notional), 9
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -444,11 +478,11 @@ class TestDeath:
         bt_types = [e["type"] for e in bt_events]
         types = [e["type"] for e in events]
         assert types.count("death") >= 1
-        # loop.py emits one hatch per death twice (brain reset + anchor
-        # re-calibration); adult mirrors that exactly — and the full event
-        # stream is byte-identical anyway via the receipt-sha check above.
-        assert types.count("hatch") == bt_types.count("hatch")
-        assert types.count("hatch") >= 3  # initial + fresh fly (+ parity quirk)
+        # loop.py v0.6 emits one hatch per death (brain reset; the anchor
+        # re-calibration follows without a second hatch); adult mirrors that
+        # exactly — and the full event stream is byte-identical anyway via
+        # the receipt-sha check above.
+        assert types.count("hatch") == bt_types.count("hatch") == 2  # initial + fresh fly
 
         death = next(e for e in events if e["type"] == "death")
         assert death["equity"] <= death["hatch_equity"] * (1.0 - 0.02)
