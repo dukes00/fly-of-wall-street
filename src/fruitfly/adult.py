@@ -1123,13 +1123,16 @@ def _load_whole_chassis():
     synthetic whole-like fixture).
 
     Production: the cached whole fly with the stripped chassis's
-    population/region labels transferred onto matched bodyIds — exactly the
-    ``transplant.labeled_chassis`` the T12b replay seam injected (the raw
-    whole-fly cache labels every node ``population="whole"``, which the
-    loop's population-keyed readouts cannot see).
+    population/region labels transferred onto matched bodyIds — the labeled
+    whole-fly chassis the T12b replay seam injected (the raw whole-fly cache
+    labels every node ``population="whole"``, which the loop's
+    population-keyed readouts cannot see).
     """
-    from fruitfly.connectome import load_stripped_chassis, load_whole_fly
-    from fruitfly.transplant import label_whole_chassis
+    from fruitfly.connectome import (
+        label_whole_chassis,
+        load_stripped_chassis,
+        load_whole_fly,
+    )
 
     return label_whole_chassis(load_whole_fly(), load_stripped_chassis())
 

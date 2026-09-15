@@ -489,3 +489,50 @@ def load_whole_fly(path: str | Path | None = None) -> Chassis:
     cache_dir = Path(path) if path else DATA_DIR
     chassis = _read_cache(cache_dir, WHOLE_NODES, WHOLE_EDGES)
     return chassis if chassis is not None else build_whole_fly(cache_dir, cache=True)
+
+# ---------------------------------------------------------------------------
+# Whole-fly chassis labeling
+# ---------------------------------------------------------------------------
+
+
+def label_whole_chassis(whole: Chassis, stripped: Chassis) -> Chassis:
+    """Transfer stripped-chassis population/region labels onto whole-fly nodes.
+
+    Whole-fly nodes are matched to stripped nodes by ``bodyId``; matched nodes
+    take the stripped chassis's ``population`` and ``region``, unmatched nodes
+    keep ``"whole"``/``"brain"``. The result's ``meta`` inherits the whole
+    fly's meta plus the stripped chassis's glomerulus channel table (the
+    smell encoder indexes identity profiles by that exact list). The node
+    bodyIds and CSR adjacency are untouched, so chassis fingerprints are
+    unchanged.
+
+    The raw whole-fly cache stores ``population="whole"`` for every node —
+    the loop's sensory encoders, ``upn_channels`` and the KC/MBON/PAM/PPL1
+    readouts all key off the population column, so the whole-fly chassis must
+    be labeled through this function before the loop can drive it.
+
+    Returns a new :class:`Chassis` sharing the whole fly's adjacency array
+    (no copy of the 781 MB edge table).
+    """
+    whole_ids = whole.nodes["bodyId"].to_numpy()
+    stripped_ids = stripped.nodes["bodyId"].to_numpy()
+
+    population = np.full(len(whole_ids), "whole", dtype=object)
+    region = np.full(len(whole_ids), "brain", dtype=object)
+
+    # searchsorted both ways over sorted bodyIds (node tables are sorted).
+    pos = np.searchsorted(stripped_ids, whole_ids)
+    hit = (pos < len(stripped_ids))
+    hit[hit] = stripped_ids[pos[hit]] == whole_ids[hit]
+    population[hit] = stripped.nodes["population"].to_numpy()[pos[hit]]
+    region[hit] = stripped.nodes["region"].to_numpy()[pos[hit]]
+
+    nodes = whole.nodes.copy()
+    nodes["population"] = population
+    nodes["region"] = region
+
+    meta = dict(whole.meta)
+    meta["glomeruli"] = list(stripped.meta["glomeruli"])
+    meta["n_glomeruli"] = len(meta["glomeruli"])
+    meta["labeled_from"] = "stripped-chassis"
+    return Chassis(nodes=nodes, adj=whole.adj, meta=meta)

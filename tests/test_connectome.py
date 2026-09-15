@@ -15,9 +15,12 @@ import numpy as np
 import pandas as pd
 import pyarrow.feather as feather
 import pytest
+import scipy.sparse as sp
 
 from fruitfly.connectome import (
+    Chassis,
     build_stripped_chassis,
+    label_whole_chassis,
     load_stripped_chassis,
     load_whole_fly,
 )
@@ -279,3 +282,58 @@ def test_load_whole_fly(fixture_dir):
     assert ch.adj[idx[950], idx[200]] == 2  # Mi1 edge present in whole fly
     assert ch.adj[idx[101], idx[950]] == 3  # R7p -> Mi1 edge present in whole fly
     assert ch.nodes.bodyId.is_monotonic_increasing
+
+
+# --- whole-fly chassis labeling ---------------------------------------------
+
+
+def _label_nodes(rows: list[tuple[int, str]]) -> pd.DataFrame:
+    """(bodyId, population-or-None) -> minimal node table (sorted bodyIds).
+
+    ``None`` population = a raw whole-fly node (cache stores ``"whole"``).
+    """
+    return pd.DataFrame(
+        [(b, p or "whole", "r" if p else "brain") for b, p in rows],
+        columns=["bodyId", "population", "region"],
+    )
+
+
+def _label_chassis(nodes: pd.DataFrame, glomeruli: list[str]) -> Chassis:
+    return Chassis(
+        nodes=nodes,
+        adj=sp.csr_matrix((len(nodes), len(nodes)), dtype=np.int64),
+        meta={"glomeruli": glomeruli, "n_glomeruli": len(glomeruli)},
+    )
+
+
+class TestLabelWholeChassis:
+    def test_labels_transfer_by_bodyid_and_unmatched_stay_whole(self):
+        stripped = _label_chassis(
+            _label_nodes([(10, "uPN"), (100, "KC"), (202, "MBON"), (310, "PPL1")]),
+            ["DA1"],
+        )
+        whole = _label_chassis(
+            _label_nodes([(10, None), (100, None), (104, None), (202, None),
+                          (203, None), (310, None)]),
+            [],
+        )
+        labeled = label_whole_chassis(whole, stripped)
+        pop = labeled.nodes.set_index("bodyId")["population"]
+        # matched nodes carry the stripped labels ...
+        assert pop.loc[100] == "KC" and pop.loc[202] == "MBON"
+        assert pop.loc[10] == "uPN" and pop.loc[310] == "PPL1"
+        # ... whole-fly-only nodes keep the raw whole-fly label
+        assert pop.loc[104] == "whole" and pop.loc[203] == "whole"
+        # region follows the same rule
+        region = labeled.nodes.set_index("bodyId")["region"]
+        assert region.loc[100] == "r" and region.loc[104] == "brain"
+
+    def test_meta_carries_stripped_glomeruli_and_adj_shared(self):
+        stripped = _label_chassis(_label_nodes([(10, "uPN"), (100, "KC")]),
+                                  ["DA1", "VA1v"])
+        whole = _label_chassis(
+            _label_nodes([(10, None), (100, None), (104, None)]), [])
+        labeled = label_whole_chassis(whole, stripped)
+        assert labeled.meta["glomeruli"] == ["DA1", "VA1v"]
+        assert labeled.adj is whole.adj  # no edge-table copy
+        assert labeled.n_neurons == whole.n_neurons
