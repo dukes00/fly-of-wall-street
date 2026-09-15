@@ -248,7 +248,185 @@ class TestDeath:
             row.split(",") for row in rows if row.startswith(death["ts"])
         )
         assert int(death_row[3]) == 0
+        # The dying fly's pending orders are cancelled with the death; the
+        # liquidations themselves stay immediate at the death bar's close.
+        cancels = [
+            e for e in events if e["type"] == "cancel" and e["cancel_reason"] == "death"
+        ]
+        assert cancels, "the dying fly's pending orders must be cancelled"
+        for liq in liquidations:
+            assert liq["ts"] == death["ts"]
 
+
+
+# ---------------------------------------------------------------------------
+# Fill model: pessimistic next-bar execution (no look-ahead)
+# ---------------------------------------------------------------------------
+
+
+def _always_buy(balance, held, cap_reached, approach_thr, avoid_thr):
+    """Decision stub: real churn every encounter, cap-aware."""
+    if held:
+        return "add", "approach"
+    if cap_reached:
+        return "pass", "cap"
+    return "buy", "approach"
+
+
+class TestFillModel:
+    """The pessimistic next-bar execution model (default fill_mode)."""
+
+    def _orders(self, result, skip_death_liquidation=True):
+        orders = [
+            e for e in _events(result.run_dir / "events.jsonl")
+            if e["type"] == "order"
+        ]
+        if skip_death_liquidation:
+            # Death liquidation is an immediate close (semantics unchanged).
+            orders = [o for o in orders if o["reason"] != "death_liquidation"]
+        return orders
+
+    def test_no_look_ahead_fills_on_the_next_bar(self, patched, tmp_path):
+        result = run_backtest(
+            _config(7, tmp_path / "run", approach_thr=0.001, avoid_thr=0.001,
+                    noise_sigma_mv=5.0)
+        )
+        frames = make_bars()
+        orders = self._orders(result)
+        assert orders, "the tight-threshold run must produce orders"
+        for o in orders:
+            decision = pd.Timestamp(o["decision_ts"])
+            assert pd.Timestamp(o["ts"]) > decision, "same-bar fill = look-ahead"
+            df = frames[o["ticker"]]
+            later = df.index[df.index > decision]
+            assert later.size, "execution bar must exist in the run window"
+            # The execution bar is the ticker's own NEXT available bar.
+            assert pd.Timestamp(o["ts"]) == later[0]
+
+    def test_pessimistic_pricing_buy_high_sell_low(self, patched, tmp_path):
+        result = run_backtest(
+            _config(7, tmp_path / "run", approach_thr=0.001, avoid_thr=0.001,
+                    noise_sigma_mv=5.0)
+        )
+        frames = make_bars()
+        orders = self._orders(result)
+        assert orders
+        for o in orders:
+            bar = frames[o["ticker"]].loc[pd.Timestamp(o["ts"])]
+            if o["side"] == "buy":
+                assert o["price"] == round(float(bar["high"]), 6)
+                assert o["price"] >= float(bar["open"])  # provably conservative
+            else:
+                assert o["price"] == round(float(bar["low"]), 6)
+                assert o["price"] <= float(bar["open"])
+
+    def test_gap_skipping_fills_on_next_available_bar(self, patched, monkeypatch,
+                                                      tmp_path):
+        loop = patched
+        frames = make_bars()
+        # AAA misses one minute: the next bar of the UNION timeline (13:31,
+        # printed by BBB) is NOT AAA's next available bar.
+        gap_ts = pd.Timestamp("2026-08-18 13:31:00", tz="UTC")
+        assert gap_ts in frames["AAA"].index
+        frames["AAA"] = frames["AAA"].drop(gap_ts)
+        monkeypatch.setattr(loop, "load_bars",
+                            lambda symbols, start=None, end=None: frames)
+        # Every encounter samples AAA, so decisions land on the gap window.
+        monkeypatch.setattr(loop, "_plume_set",
+                            lambda frames, ts, top_k: [("AAA", 1.0)])
+        monkeypatch.setattr(loop, "_decide", _always_buy)
+        result = run_backtest(_config(7, tmp_path / "run"))
+        aaa_orders = [o for o in self._orders(result) if o["ticker"] == "AAA"]
+        assert aaa_orders
+        # The 13:30 decision's naive "next timeline bar" is 13:31 (BBB
+        # printed there); AAA itself next prints at 13:32 -> fill there.
+        first = next(
+            o for o in aaa_orders
+            if o["decision_ts"] == "2026-08-18T13:30:00+00:00"
+        )
+        assert first["ts"] == "2026-08-18T13:32:00+00:00"
+        for o in aaa_orders:
+            decision = pd.Timestamp(o["decision_ts"])
+            later = frames["AAA"].index[frames["AAA"].index > decision]
+            assert pd.Timestamp(o["ts"]) == later[0]
+
+    def test_pending_order_carries_across_session_close(self, patched,
+                                                        monkeypatch, tmp_path):
+        loop = patched
+        monkeypatch.setattr(loop, "_decide", _always_buy)
+        result = run_backtest(_config(7, tmp_path / "run"))
+        frames = make_bars()
+        crossing = [
+            o for o in self._orders(result)
+            if o["decision_ts"] == "2026-08-18T13:34:00+00:00"
+        ]
+        assert crossing, "a decision on day 1's last bar must exist"
+        day2_open = pd.Timestamp("2026-08-19 13:30:00", tz="UTC")
+        for o in crossing:
+            # Unfilled at the session close -> carried into the next session.
+            assert pd.Timestamp(o["ts"]) == day2_open
+            assert o["price"] == round(
+                float(frames[o["ticker"]].at[day2_open, "high"]), 6
+            )
+
+    def test_pending_order_cancelled_at_run_end(self, patched, monkeypatch,
+                                                tmp_path):
+        loop = patched
+        monkeypatch.setattr(loop, "_decide", _always_buy)
+        result = run_backtest(_config(7, tmp_path / "run"))
+        events = _events(result.run_dir / "events.jsonl")
+        cancels = [e for e in events if e["type"] == "cancel"]
+        assert cancels
+        assert all(e["cancel_reason"] == "run_end" for e in cancels)
+        # The last bar's decision can never fill -> cancelled at run end.
+        assert any(
+            e["decision_ts"] == "2026-08-19T13:34:00+00:00" for e in cancels
+        )
+        # Cancels precede the close-of-day settle: the run still ends asleep.
+        assert events[-1]["type"] == "sleep"
+
+    def test_close_mode_is_the_documented_look_ahead_hatch(self, patched,
+                                                          tmp_path):
+        result = run_backtest(
+            _config(7, tmp_path / "run", fill_mode="close",
+                    approach_thr=0.001, avoid_thr=0.001, noise_sigma_mv=5.0)
+        )
+        frames = make_bars()
+        orders = self._orders(result)
+        assert orders
+        for o in orders:
+            # Legacy semantics: same-bar close fill, decision_ts == ts.
+            assert o["ts"] == o["decision_ts"]
+            assert o["price"] == round(
+                float(frames[o["ticker"]].at[pd.Timestamp(o["ts"]), "close"]), 6
+            )
+
+    def test_position_cap_counts_queued_buys(self, patched, monkeypatch,
+                                             tmp_path):
+        loop = patched
+        monkeypatch.setattr(loop, "_decide", _always_buy)
+        result = run_backtest(_config(7, tmp_path / "run", position_cap=1))
+        rows = (result.run_dir / "equity.csv").read_text().splitlines()[1:]
+        # Queued buys count toward the cap, so fills can never exceed it.
+        assert all(int(row.split(",")[3]) <= 1 for row in rows)
+
+    def test_fees_default_zero_untouched(self, patched, tmp_path):
+        result = run_backtest(
+            _config(7, tmp_path / "run", approach_thr=0.001, avoid_thr=0.001,
+                    noise_sigma_mv=5.0)
+        )
+        orders = [
+            e for e in _events(result.run_dir / "events.jsonl")
+            if e["type"] == "order"
+        ]
+        assert orders
+        cash = 100_000.0
+        for o in orders:
+            if o["side"] == "buy":
+                cash -= o["shares"] * o["price"]  # no fee margin
+            else:
+                cash += o["shares"] * o["price"]
+            assert o["cash_after"] == pytest.approx(round(cash, 6))
 
 # ---------------------------------------------------------------------------
 # Chassis config (whole-fly phase 1): validation + sim construction
@@ -263,6 +441,14 @@ class TestChassisConfig:
         assert cfg.chassis == "stripped"
         assert cfg.std_beta is None
         assert cfg.std_tau_rec_ms is None
+
+    def test_fill_mode_validation(self):
+        assert BacktestConfig(
+            seed=1, start="2026-08-18", end="2026-08-18"
+        ).fill_mode == "pessimistic_next_bar"
+        with pytest.raises(ValueError, match="fill_mode"):
+            BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
+                           fill_mode="market")
 
     def test_whole_chassis_gets_calibrated_std_defaults(self):
         cfg = BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",

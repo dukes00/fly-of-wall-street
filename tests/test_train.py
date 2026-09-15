@@ -278,18 +278,22 @@ class TestDeathHatch:
         loop = crashed
         # Death on the first bar of day 2 (crash on bar 6 of 10): the
         # hatched fly keeps foraging afterwards, with its own hatch equity.
+        # Under the pessimistic next-bar fill model the pre-crash book is
+        # one fill smaller (buys land a bar later), so the death line is
+        # pulled in to -30% to keep the mid-run death scenario.
         monkeypatch.setattr(
             loop, "load_bars",
             lambda symbols, start=None, end=None: make_bars(2, crash_idx=5),
         )
         result = loop.run_backtest(
-            _config(tmp_path / "run", position_cap=2, shock_adverse_pct=1.0e9)
+            _config(tmp_path / "run", position_cap=2, shock_adverse_pct=1.0e9,
+                    death_threshold=-0.30)
         )
         events = _events(result.run_dir / "events.jsonl")
         types = [event["type"] for event in events]
         assert types.count("death") >= 1
         deaths = [e for e in events if e["type"] == "death"]
-        assert deaths and deaths[0]["equity"] <= deaths[0]["hatch_equity"] * 0.5
+        assert deaths and deaths[0]["equity"] <= deaths[0]["hatch_equity"] * 0.7
         assert deaths[0]["hatch_equity"] > 0.0
         # wake after the death hatch: the hatched fly keeps encountering
         assert types.count("encounter") > 5

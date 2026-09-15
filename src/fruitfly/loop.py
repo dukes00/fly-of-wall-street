@@ -41,14 +41,32 @@ are ~0 and sizing rides the floor.
 
 Exits (DESIGN §6): a held ticker re-encountered with an avoid balance is
 closed (valence flip); any open position whose unrealized P&L drops below
-``-shock_adverse_pct`` is closed immediately (sharp adverse move → shock —
+``-shock_adverse_pct`` triggers a close (sharp adverse move → shock —
 the biological stop-loss bypasses the brain); when portfolio drawdown from
 hatch equity crosses ``hunger_drawdown`` the fly closes its largest winner
 (hunger → take profit), re-arming when drawdown recovers below half the
-threshold. Fills are at the current bar's close price, whole shares, with
-proportional ``fees`` on each side (default 0).
+threshold.
+
+**Execution model (pessimistic next-bar fills).** An order decided during
+bar ``t`` is PENDING and executes on the symbol's NEXT available bar (the
+symbol's own next bar; gaps/halts are skipped, and an order unfilled at a
+session close carries into the next session). No look-ahead: the decision
+uses only bar-``t``-and-earlier data, the fill consumes only later bars.
+Fills are pessimistically intra-bar — BUY at the execution bar's HIGH, SELL
+at its LOW (parameter-free and provably conservative: any real fill lies
+within [low, high], so this can only understate performance). Sells close
+the WHOLE current position at fill time; the position cap (D13) counts open
+positions plus queued buys so fills can never exceed it. Equity marking
+stays at close prices — marking is not execution. Whole shares, with
+proportional ``fees`` on each side (default 0 — commission-free
+brokerage). Pending orders are cancelled with a ``cancel`` event when the
+fly dies (the brain that placed them is discarded) and at run end if their
+symbol never prints again. Order receipts carry both bars (``decision_ts``
+and execution ``ts``) plus the executed price for fill-quality audits.
+``config.fill_mode="close"`` restores the previous same-bar close fills —
+documented as LOOK-AHEAD-BIASED and kept only as a comparison escape hatch.
 Cash accounting is paper accounting: buys deduct cash without a balance
-check (a bar's close fill can push cash negative and gross exposure past
+check (a next-bar fill can push cash negative and gross exposure past
 equity — margin, in effect); equity = cash + marked positions is the only
 solvency signal, and D14's death threshold acts on it.
 
@@ -60,10 +78,11 @@ arousal maps the day's mean |1-bar return| to [0, 1]; one
 ``Plasticity.sleep()`` consolidates and the fly logs the sleep event.
 
 Death (D14): when equity <= ``hatch_equity * (1 + death_threshold)`` the fly
-dies: remaining positions are liquidated at the bar close, a fresh
-``Plasticity`` hatches (brain reset), and the new fly's hatch equity is the
-post-liquidation equity. Death and hatch are logged as events (T9 exercises
-this).
+dies: remaining positions are liquidated immediately at the death bar's
+last close (settle semantics unchanged by the fill model), the dying fly's
+pending orders are cancelled, a fresh ``Plasticity`` hatches (brain reset),
+and the new fly's hatch equity is the post-liquidation equity. Death and
+hatch are logged as events (T9 exercises this).
 
 Determinism (hard gate): the engine is RNG-free; the LOOP owns the only RNG,
 ``np.random.Generator(np.random.PCG64(seed))``, consumed in a fixed order —
@@ -104,7 +123,12 @@ from fruitfly.senses.smell import upn_channels
 from fruitfly.sim import LIFSim
 
 __all__ = [
+    "DEFAULT_FILL_MODE",
+    "FILL_MODES",
+    "FILL_MODE_CLOSE",
     "BacktestConfig",
+    "PendingOrder",
+    "PendingOrderBook",
     "RunResult",
     "resolve_chassis_fields",
     "run_backtest",
@@ -170,6 +194,17 @@ INITIAL_CASH = 100_000.0
 WHOLE_CHASSIS_STD_BETA = 0.1
 WHOLE_CHASSIS_STD_TAU_REC_MS = 500.0
 
+#: Fill models. ``"pessimistic_next_bar"`` (default): an order decided on
+#: bar t is pending and fills on the symbol's next available bar — BUY at
+#: that bar's HIGH, SELL at its LOW (parameter-free, provably conservative:
+#: any real fill lies within [low, high], so performance can only be
+#: understated). ``"close"``: legacy same-bar close fills — documented as
+#: LOOK-AHEAD-BIASED (the decision sees bar-t data and fills at bar t's
+#: close); kept only as a comparison escape hatch.
+DEFAULT_FILL_MODE = "pessimistic_next_bar"
+FILL_MODES = ("pessimistic_next_bar", "close")
+FILL_MODE_CLOSE = "close"
+
 
 # ---------------------------------------------------------------------------
 # Config / result
@@ -193,6 +228,9 @@ class BacktestConfig:
     death_threshold: float = DEATH_THRESHOLD
     #: Proportional per-side fee (0 = paper fills).
     fees: float = 0.0
+    #: Fill model: ``"pessimistic_next_bar"`` (default) or the legacy
+    #: look-ahead-biased ``"close"`` (see ``DEFAULT_FILL_MODE`` above).
+    fill_mode: str = DEFAULT_FILL_MODE
     initial_cash: float = INITIAL_CASH
     shock_adverse_pct: float = SHOCK_ADVERSE_PCT
     hunger_drawdown: float = HUNGER_DRAWDOWN
@@ -228,6 +266,10 @@ class BacktestConfig:
             raise ValueError("death_threshold must be in (-1, 0)")
         if self.fees < 0:
             raise ValueError("fees must be non-negative")
+        if self.fill_mode not in FILL_MODES:
+            raise ValueError(
+                f"fill_mode must be one of {FILL_MODES}, got {self.fill_mode!r}"
+            )
         chassis, std_beta, std_tau_rec_ms = resolve_chassis_fields(
             self.chassis, self.std_beta, self.std_tau_rec_ms
         )
@@ -257,6 +299,85 @@ class RunResult:
 class _Position:
     shares: int
     avg_cost: float
+
+
+@dataclass(frozen=True)
+class PendingOrder:
+    """A market order decided on one bar, awaiting its next-bar execution."""
+
+    #: The bar whose data produced the decision (receipts audit field).
+    decision_ts: pd.Timestamp
+    ticker: str
+    #: "buy" | "sell".
+    side: str
+    reason: str
+    #: Fixed share count for buys. Sells leave this ``None``: they close the
+    #: WHOLE current position at fill time (the book can change while the
+    #: order waits, so decision-time sizing would be wrong).
+    shares: int | None = None
+
+
+class PendingOrderBook:
+    """The pessimistic next-bar fill queue — the loop's fill engine.
+
+    An order decided on bar ``t`` of a symbol fills on that symbol's NEXT
+    available bar (skipping gaps/halts); BUY fills at that bar's HIGH, SELL
+    at its LOW. An order unfilled at a session close simply stays queued
+    and carries into the next session. Pure and deterministic (no wall
+    clock, no RNG): the same bar data always produces the same fills, so
+    the same-seed byte-identity gate holds.
+    """
+
+    def __init__(
+        self, frames: dict[str, pd.DataFrame], fill_mode: str = DEFAULT_FILL_MODE
+    ) -> None:
+        if fill_mode not in FILL_MODES:
+            raise ValueError(f"fill_mode must be one of {FILL_MODES}, got {fill_mode!r}")
+        self._frames = frames
+        self._fill_mode = fill_mode
+        self._pending: list[PendingOrder] = []
+
+    @property
+    def fill_mode(self) -> str:
+        return self._fill_mode
+
+    def submit(self, order: PendingOrder) -> None:
+        """Queue an order decided on the current bar."""
+        self._pending.append(order)
+
+    def has_pending(self, ticker: str) -> bool:
+        """True while any order for ``ticker`` is still queued (the
+        mechanical-exit guards use this to avoid duplicate triggers)."""
+        return any(o.ticker == ticker for o in self._pending)
+
+    def n_buys(self) -> int:
+        """Queued buy count: the position cap (D13) counts open positions
+        plus queued buys, so fills can never exceed the cap."""
+        return sum(1 for o in self._pending if o.side == "buy")
+
+    def pending_orders(self) -> list[PendingOrder]:
+        return list(self._pending)
+
+    def drain(self, ts: pd.Timestamp) -> list[tuple[PendingOrder, float]]:
+        """Orders whose symbol's next available bar is ``ts``, FIFO, paired
+        with the pessimistic fill price (high for buys, low for sells)."""
+        fills: list[tuple[PendingOrder, float]] = []
+        for o in self._pending:
+            df = self._frames.get(o.ticker)
+            if df is None or ts <= o.decision_ts or ts not in df.index:
+                continue
+            price = float(df.at[ts, "high" if o.side == "buy" else "low"])
+            fills.append((o, price))
+        if fills:
+            filled = {id(o) for o, _ in fills}
+            self._pending = [o for o in self._pending if id(o) not in filled]
+        return fills
+
+    def cancel_all(self) -> list[PendingOrder]:
+        """Drop and return every queued order (death / run-end cancels)."""
+        orders = self._pending
+        self._pending = []
+        return orders
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +623,7 @@ def run_backtest(config: BacktestConfig) -> RunResult:
         n_events += 1
 
     def order(
-        ts: pd.Timestamp, ticker: str, side: str, reason: str, shares: int, price: float,
+        ts: pd.Timestamp, o: PendingOrder, price: float, shares: int,
         realized_pnl: float | None, cash_after: float,
     ) -> None:
         nonlocal n_orders
@@ -511,9 +632,10 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             {
                 "type": "order",
                 "ts": ts.isoformat(),
-                "ticker": ticker,
-                "side": side,
-                "reason": reason,
+                "decision_ts": o.decision_ts.isoformat(),
+                "ticker": o.ticker,
+                "side": o.side,
+                "reason": o.reason,
                 "shares": shares,
                 "price": round(price, 6),
                 "realized_pnl": None if realized_pnl is None else round(realized_pnl, 6),
@@ -522,11 +644,25 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             }
         )
 
+    def cancel(o: PendingOrder, ts: pd.Timestamp, cancel_reason: str) -> None:
+        emit(
+            {
+                "type": "cancel",
+                "ts": ts.isoformat(),
+                "decision_ts": o.decision_ts.isoformat(),
+                "ticker": o.ticker,
+                "side": o.side,
+                "reason": o.reason,
+                "cancel_reason": cancel_reason,
+            }
+        )
+
     # --- mutable run state -------------------------------------------------
     cash = config.initial_cash
     hatch_equity = config.initial_cash
     positions: dict[str, _Position] = {}
     last_close: dict[str, float] = {}
+    pending_book = PendingOrderBook(frames, config.fill_mode)
     cur_day: date | None = None
     pointer = 0
     pointer_drawn = False
@@ -546,15 +682,47 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     def equity_at() -> float:
         return cash + math.fsum(p.shares * last_close[s] for s, p in positions.items())
 
-    def close_position(ts: pd.Timestamp, ticker: str, reason: str) -> float:
-        """Sell a position at the last close; returns realized P&L in dollars."""
-        price = last_close[ticker]
-        pos = positions.pop(ticker)
+    def apply_buy(ts: pd.Timestamp, o: PendingOrder, price: float) -> None:
+        """Buy/add fill on the paper book: whole shares, proportional fees,
+        cash deducted without a balance check (documented margin)."""
         nonlocal cash
+        shares = o.shares
+        cash -= shares * price * (1.0 + config.fees)
+        pos = positions.get(o.ticker)
+        if pos is None:
+            positions[o.ticker] = _Position(shares=shares, avg_cost=price)
+        else:
+            total = pos.shares + shares
+            pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total
+            pos.shares = total
+        order(ts, o, price, shares, None, cash)
+
+    def apply_sell(ts: pd.Timestamp, o: PendingOrder, price: float) -> float | None:
+        """Close the WHOLE current position at ``price``; returns realized
+        P&L, or ``None`` when there is nothing left to sell (the caller
+        cancels the order)."""
+        nonlocal cash
+        pos = positions.pop(o.ticker, None)
+        if pos is None:
+            return None
         proceeds = pos.shares * price * (1.0 - config.fees)
         cash += proceeds
         realized = proceeds - pos.shares * pos.avg_cost
-        order(ts, ticker, "sell", reason, pos.shares, price, realized, cash)
+        order(ts, o, price, pos.shares, realized, cash)
+        return realized
+
+    def close_position(ts: pd.Timestamp, ticker: str, reason: str) -> float:
+        """Immediate close at the last close — death liquidation (semantics
+        unchanged by the fill model) and the fill_mode="close" escape hatch."""
+        price = last_close[ticker]
+        realized = apply_sell(
+            ts,
+            PendingOrder(
+                decision_ts=ts, ticker=ticker, side="sell", reason=reason
+            ),
+            price,
+        )
+        assert realized is not None  # the caller only closes held positions
         return realized
 
     def settle_and_sleep(day: date) -> None:
@@ -610,11 +778,26 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             pointer_drawn = False
             emit({"type": "wake", "ts": ts.isoformat()})
 
-        # 1. Mark prices (fills and marks are at this bar's close).
+        # 1. Mark prices (equity marking stays at close prices — marking is
+        # not execution), then fill pending orders whose symbol's next
+        # available bar is this one (pessimistic next-bar model).
         for ticker, df in frames.items():
             i = df.index.get_indexer([ts], method="pad")[0]
             if i >= 0 and df.index[i] == ts:
                 last_close[ticker] = float(df["close"].iloc[i])
+
+        # 1b. Pending-order fills: an order decided on an earlier bar
+        # executes now iff its symbol prints here (gaps/halts skipped;
+        # a session close just carries the order into the next session).
+        for o, fill_price in pending_book.drain(ts):
+            if o.side == "buy":
+                apply_buy(ts, o, fill_price)
+                continue
+            realized = apply_sell(ts, o, fill_price)
+            if realized is None:
+                cancel(o, ts, "no_position")  # closed before the fill landed
+            else:
+                day_realized += realized
 
         # 2. Mechanical exits, independent of encounters (DESIGN §6.5).
         for ticker in sorted(positions):
@@ -622,7 +805,17 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             price = last_close[ticker]
             pnl_pct = (price / pos.avg_cost - 1.0) * 100.0
             if pnl_pct <= -config.shock_adverse_pct:
-                day_realized += close_position(ts, ticker, "shock")
+                if pending_book.fill_mode == FILL_MODE_CLOSE:
+                    day_realized += close_position(ts, ticker, "shock")
+                elif not pending_book.has_pending(ticker):
+                    # Queue the stop-loss: it lands one bar later (the
+                    # execution delay is the point — no look-ahead compensation).
+                    pending_book.submit(
+                        PendingOrder(
+                            decision_ts=ts, ticker=ticker, side="sell",
+                            reason="shock",
+                        )
+                    )
         equity = equity_at()
         drawdown = max(0.0, 1.0 - equity / hatch_equity)
         if drawdown >= config.hunger_drawdown and hunger_armed:
@@ -634,8 +827,18 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                 key=lambda t: (-t[1], t[0]),
             )
             if winners and winners[0][1] > 0.0:
-                day_realized += close_position(ts, winners[0][0], "hunger")
-                hunger_armed = False
+                winner = winners[0][0]
+                if pending_book.fill_mode == FILL_MODE_CLOSE:
+                    day_realized += close_position(ts, winner, "hunger")
+                    hunger_armed = False
+                elif not pending_book.has_pending(winner):
+                    pending_book.submit(
+                        PendingOrder(
+                            decision_ts=ts, ticker=winner, side="sell",
+                            reason="hunger",
+                        )
+                    )
+                    hunger_armed = False
         elif drawdown < 0.5 * config.hunger_drawdown:
             hunger_armed = True
 
@@ -716,11 +919,12 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                 }
             )
 
-            # 6. Decision + order (fills at this bar's close).
+            # 6. Decision + order (fills on the symbol's next available bar).
             held = ticker in positions
             price = last_close[ticker]
             action, reason = _decide(
-                centered, held, len(positions) >= config.position_cap,
+                centered, held,
+                len(positions) + pending_book.n_buys() >= config.position_cap,
                 config.approach_thr, config.avoid_thr,
             )
             shares = 0
@@ -739,21 +943,26 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                     "reason": reason,
                 }
             )
-            if action == "buy":
-                cost = shares * price * (1.0 + config.fees)
-                cash -= cost
-                positions[ticker] = _Position(shares=shares, avg_cost=price)
-                order(ts, ticker, "buy", reason, shares, price, None, cash)
-            elif action == "add":
-                cost = shares * price * (1.0 + config.fees)
-                cash -= cost
-                pos = positions[ticker]
-                total = pos.shares + shares
-                pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total
-                pos.shares = total
-                order(ts, ticker, "buy", reason, shares, price, None, cash)
+            if action in ("buy", "add"):
+                o = PendingOrder(
+                    decision_ts=ts, ticker=ticker, side="buy", reason=reason,
+                    shares=shares,
+                )
+                if pending_book.fill_mode == FILL_MODE_CLOSE:
+                    apply_buy(ts, o, price)  # legacy same-bar close fill
+                else:
+                    pending_book.submit(o)
             elif action == "sell":
-                day_realized += close_position(ts, ticker, reason)
+                if pending_book.fill_mode == FILL_MODE_CLOSE:
+                    day_realized += close_position(ts, ticker, reason)
+                else:
+                    # Sells close the WHOLE position at fill time.
+                    pending_book.submit(
+                        PendingOrder(
+                            decision_ts=ts, ticker=ticker, side="sell",
+                            reason=reason,
+                        )
+                    )
 
         # 7. Death check (D14): equity <= hatch * (1 + threshold) kills the fly.
         equity = equity_at()
@@ -769,6 +978,8 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             n_deaths += 1
             for ticker in sorted(positions):
                 day_realized += close_position(ts, ticker, "death_liquidation")
+            for o in pending_book.cancel_all():
+                cancel(o, ts, "death")  # the brain that placed them is gone
             plasticity = Plasticity(chassis)
             sim.reset(config.seed)
             daily_spikes.fill(0)
@@ -791,6 +1002,10 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             [ts.isoformat(), f"{equity:.2f}", f"{cash:.2f}", len(positions)]
         )
         n_bars += 1
+
+    # Run end: any order whose symbol never printed again is cancelled.
+    for o in pending_book.cancel_all():
+        cancel(o, timeline[-1], "run_end")
 
     if cur_day is not None:
         settle_and_sleep(cur_day)

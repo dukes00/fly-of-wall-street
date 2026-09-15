@@ -39,11 +39,12 @@ from fruitfly.adult import (
     FlyState,
     LiveExecution,
     ReplayFeed,
+    SimulatedExecution,
     next_session_open,
 )
 from fruitfly.broker import OrderEvent
 from fruitfly.connectome import Chassis
-from fruitfly.loop import BacktestConfig, run_backtest
+from fruitfly.loop import BacktestConfig, PendingOrder, run_backtest
 from fruitfly.train import chassis_fingerprint, save_larval_weights
 
 # --- synthetic chassis (mirrors tests/test_loop.py populations) -------------
@@ -321,6 +322,91 @@ class TestResume:
             AdultRun(cfg).run()
 
 
+    def test_resume_carries_pending_orders(self, patched, monkeypatch, tmp_path):
+        """Pending pessimistic next-bar orders survive the state file: the
+        resumed fly's receipts match the uninterrupted reference byte for
+        byte (orders queued before the kill keep waiting)."""
+        import fruitfly.adult as adult
+        monkeypatch.setattr(adult, "_decide", _always_buy)
+
+        cfg = _config(tmp_path / "ref")
+        AdultRun(cfg).run()
+        expected = _receipt_shas(cfg.run_directory())
+
+        victim = _config(tmp_path / "victim")
+        run_dir = victim.run_directory()
+        inner = ReplayFeed(victim)
+        with pytest.raises(_KillAfter):
+            AdultRun(victim, feed=_KillingFeed(inner, kill_after=7)).run()
+        state = FlyState.load(run_dir / STATE_FILE)
+        assert state.pending, "an order must be pending at the kill"
+        assert all(o.side == "buy" for o in state.pending)
+
+        result = AdultRun(victim).run()
+        assert result.resumed is True
+        assert _receipt_shas(run_dir) == expected
+
+
+def _always_buy(balance, held, cap_reached, approach_thr, avoid_thr):
+    """Decision stub: real churn every encounter, cap-aware."""
+    if held:
+        return "add", "approach"
+    if cap_reached:
+        return "pass", "cap"
+    return "buy", "approach"
+
+
+class TestSimulatedExecution:
+    """The replay broker seam runs the loop's pessimistic next-bar model."""
+
+    def test_pending_fills_at_execution_bar_high_and_low(self):
+        frames = make_bars()
+        execution = SimulatedExecution(frames=frames)
+        ts = pd.Timestamp("2026-08-18 13:30:00", tz="UTC")
+        nxt = pd.Timestamp("2026-08-18 13:31:00", tz="UTC")
+
+        execution.book.submit(
+            PendingOrder(decision_ts=ts, ticker="AAA", side="buy",
+                         reason="approach", shares=10)
+        )
+        fills = execution.book.drain(nxt)
+        assert len(fills) == 1
+        o, price = fills[0]
+        assert o.ticker == "AAA" and o.shares == 10
+        assert price == float(frames["AAA"].at[nxt, "high"])
+        assert price != float(frames["AAA"].at[nxt, "close"])  # not the close
+
+        execution.book.submit(
+            PendingOrder(decision_ts=ts, ticker="BBB", side="sell",
+                         reason="avoid")
+        )
+        fills = execution.book.drain(nxt)
+        assert len(fills) == 1
+        o, price = fills[0]
+        assert price == float(frames["BBB"].at[nxt, "low"])
+
+    def test_pending_order_skips_gap_and_cancel_all(self):
+        frames = make_bars()
+        gap_ts = pd.Timestamp("2026-08-18 13:31:00", tz="UTC")
+        frames["AAA"] = frames["AAA"].drop(gap_ts)
+        execution = SimulatedExecution(frames=frames)
+        ts = pd.Timestamp("2026-08-18 13:30:00", tz="UTC")
+        execution.book.submit(
+            PendingOrder(decision_ts=ts, ticker="AAA", side="buy",
+                         reason="approach", shares=10)
+        )
+        # 13:31 is the next union-timeline bar but AAA does not print there.
+        assert execution.book.drain(gap_ts) == []
+        nxt = pd.Timestamp("2026-08-18 13:32:00", tz="UTC")
+        assert execution.book.drain(nxt)
+        assert not execution.book.pending_orders()
+
+    def test_close_mode_fills_at_reference_price(self):
+        execution = SimulatedExecution(fill_mode="close")
+        ts = pd.Timestamp("2026-08-18 13:31:00", tz="UTC")
+        assert execution.execute(ts, "AAA", "buy", 10, 424.0) == 424.0
+
+
 # ---------------------------------------------------------------------------
 # Death -> hatch (D14), with loop parity
 # ---------------------------------------------------------------------------
@@ -397,7 +483,7 @@ class TestState:
             "hatch_equity", "equity", "cur_day", "pointer", "pointer_drawn",
             "anchor", "daily_signal_encounters", "day_realized", "day_abs_ret_sum",
             "day_abs_ret_n", "hunger_armed", "rng_state", "n_bars", "n_events",
-            "n_orders", "n_deaths", "last_ts",
+            "n_orders", "n_deaths", "last_ts", "pending",
         ):
             assert getattr(after, name) == getattr(before, name), name
         assert set(after.positions) == set(before.positions)

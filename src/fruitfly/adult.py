@@ -16,10 +16,14 @@ path shared by both modes:
   (identical construction to ``loop.run_backtest``); live polls real 1-minute
   bars per session minute, gated on the NYSE calendar helpers.
 - **Broker seam** (:class:`SimulatedExecution` / :class:`LiveExecution`):
-  turns a decision into a fill price. Replay fills at the bar's close
-  (backtest semantics); live submits an :class:`~fruitfly.broker.OrderEvent`
-  to the paper-only :class:`~fruitfly.broker.AlpacaPaperBroker` and polls the
-  actual fill.
+  turns a decision into a fill. Replay runs the loop's pessimistic
+  next-bar fill model (:class:`~fruitfly.loop.PendingOrderBook`: orders
+  decided on bar t fill on the symbol's next available bar, BUY at that
+  bar's HIGH, SELL at its LOW; ``fill_mode="close"`` restores the legacy
+  look-ahead-biased same-bar close fill); live submits an
+  :class:`~fruitfly.broker.OrderEvent` to the paper-only
+  :class:`~fruitfly.broker.AlpacaPaperBroker` and polls the actual fill
+  (unchanged by the fill model).
 
 Cash/position accounting stays in the driver (single book of record, same
 arithmetic as the loop), so replay receipts are byte-identical to
@@ -79,7 +83,10 @@ from fruitfly.loop import (
     APPROACH_THR,
     AVOID_THR,
     DEATH_THRESHOLD,
+    DEFAULT_FILL_MODE,
     DT_MS,
+    FILL_MODE_CLOSE,
+    FILL_MODES,
     HUNGER_DRAWDOWN,
     INITIAL_CASH,
     NOISE_SIGMA_MV,
@@ -87,6 +94,8 @@ from fruitfly.loop import (
     SMELL_GAIN,
     VISION_WINDOW_BARS,
     BacktestConfig,
+    PendingOrder,
+    PendingOrderBook,
     _decide,
     _features_at,
     _innate_balance,
@@ -154,6 +163,7 @@ class AdultConfig:
     ms_per_bar: float = 500.0
     death_threshold: float = DEATH_THRESHOLD
     fees: float = 0.0
+    fill_mode: str = DEFAULT_FILL_MODE
     initial_cash: float = INITIAL_CASH
     shock_adverse_pct: float = SHOCK_ADVERSE_PCT
     hunger_drawdown: float = HUNGER_DRAWDOWN
@@ -182,6 +192,10 @@ class AdultConfig:
             raise ValueError("death_threshold must be in (-1, 0)")
         if self.fees < 0:
             raise ValueError("fees must be non-negative")
+        if self.fill_mode not in FILL_MODES:
+            raise ValueError(
+                f"fill_mode must be one of {FILL_MODES}, got {self.fill_mode!r}"
+            )
         chassis, std_beta, std_tau_rec_ms = resolve_chassis_fields(
             self.chassis, self.std_beta, self.std_tau_rec_ms
         )
@@ -200,6 +214,7 @@ class AdultConfig:
             ms_per_bar=self.ms_per_bar,
             death_threshold=self.death_threshold,
             fees=self.fees,
+            fill_mode=self.fill_mode,
             initial_cash=self.initial_cash,
             shock_adverse_pct=self.shock_adverse_pct,
             hunger_drawdown=self.hunger_drawdown,
@@ -231,6 +246,7 @@ class AdultConfig:
             "ms_per_bar": self.ms_per_bar,
             "death_threshold": self.death_threshold,
             "fees": self.fees,
+            "fill_mode": self.fill_mode,
             "initial_cash": self.initial_cash,
             "shock_adverse_pct": self.shock_adverse_pct,
             "hunger_drawdown": self.hunger_drawdown,
@@ -297,6 +313,8 @@ class FlyState:
     equity: float = 0.0
     positions: dict[str, _Position] = field(default_factory=dict)
     last_close: dict[str, float] = field(default_factory=dict)
+    #: Queued pessimistic next-bar orders (loop parity: ``PendingOrderBook``).
+    pending: list = field(default_factory=list)
 
     # Foraging state.
     cur_day: str | None = None
@@ -347,6 +365,16 @@ class FlyState:
                 for t, p in self.positions.items()
             },
             "last_close": self.last_close,
+            "pending": [
+                {
+                    "decision_ts": o.decision_ts.isoformat(),
+                    "ticker": o.ticker,
+                    "side": o.side,
+                    "reason": o.reason,
+                    "shares": o.shares,
+                }
+                for o in self.pending
+            ],
             "cur_day": self.cur_day,
             "pointer": self.pointer,
             "pointer_drawn": self.pointer_drawn,
@@ -401,6 +429,16 @@ class FlyState:
             for t, p in payload["positions"].items()
         }
         state.last_close = {t: float(v) for t, v in payload["last_close"].items()}
+        state.pending = [
+            PendingOrder(
+                decision_ts=pd.Timestamp(o["decision_ts"]),
+                ticker=o["ticker"],
+                side=o["side"],
+                reason=o["reason"],
+                shares=None if o["shares"] is None else int(o["shares"]),
+            )
+            for o in payload["pending"]
+        ]
         state.cur_day = payload["cur_day"]
         state.pointer = payload["pointer"]
         state.pointer_drawn = payload["pointer_drawn"]
@@ -466,7 +504,30 @@ class ReplayFeed:
 
 
 class SimulatedExecution:
-    """Broker seam, replay mode: fills at the bar's close (backtest semantics)."""
+    """Broker seam, replay mode: fills through the loop's fill engine.
+
+    With the default ``fill_mode="pessimistic_next_bar"`` the seam owns a
+    :class:`~fruitfly.loop.PendingOrderBook` over the replay frames
+    (:attr:`book`): the driver queues decided orders on it and drains the
+    pessimistic next-bar fills (BUY at the execution bar's HIGH, SELL at its
+    LOW, gaps/halts skipped) on later bars — the same model as
+    ``loop.run_backtest``, so replay receipts stay byte-identical.
+    ``fill_mode="close"`` restores the legacy same-bar close fill
+    (documented look-ahead-biased escape hatch).
+    """
+
+    def __init__(
+        self,
+        frames: dict[str, pd.DataFrame] | None = None,
+        fill_mode: str = DEFAULT_FILL_MODE,
+    ) -> None:
+        self.fill_mode = fill_mode
+        self._book = PendingOrderBook(frames or {}, fill_mode)
+
+    @property
+    def book(self) -> PendingOrderBook:
+        """The pending-order queue (pending mode; unused in close mode)."""
+        return self._book
 
     def execute(
         self,
@@ -476,6 +537,8 @@ class SimulatedExecution:
         shares: int,
         reference_price: float,
     ) -> float | None:
+        """Immediate fill at the reference price — used only in close mode
+        (the pending model routes orders through :attr:`book` instead)."""
         return reference_price
 
 
@@ -753,11 +816,24 @@ class AdultRun:
             rng.bit_generator.state = st.rng_state
         self._rng = rng
 
-        execution = self._execution or SimulatedExecution()
-        self._execution = execution
-
         feed = self._feed or (ReplayFeed(cfg) if cfg.mode == "replay" else LivePaperFeed())
         frames = feed.frames()
+
+        execution = self._execution or SimulatedExecution(
+            frames=frames, fill_mode=cfg.fill_mode
+        )
+        self._execution = execution
+        # Pending mode (replay + pessimistic model): the driver drains this
+        # book bar by bar; close mode / the live seam keep immediate fills.
+        self._pending_book = (
+            execution.book
+            if isinstance(execution, SimulatedExecution)
+            and execution.fill_mode != FILL_MODE_CLOSE
+            else None
+        )
+        if resumed and self._pending_book is not None:
+            for o in st.pending:  # orders queued before the kill keep waiting
+                self._pending_book.submit(o)
 
         start_ts, end_ts = _window(cfg.start, cfg.end)
 
@@ -786,11 +862,15 @@ class AdultRun:
             if st.n_bars % cfg.persist_every == 0:
                 self._persist(state_path)
 
+
+        # Run end: any order whose symbol never printed again is cancelled.
+        if self._pending_book is not None and self._pending_book.pending_orders():
+            for o in self._pending_book.cancel_all():
+                self._cancel(o, pd.Timestamp(st.last_ts), "run_end")
         if st.cur_day is not None:
             self._settle_and_sleep(st.cur_day)
 
         self._persist(state_path)
-        equity_file.close()
         events_file.close()
         return AdultResult(
             run_dir=run_dir,
@@ -807,6 +887,9 @@ class AdultRun:
     def _persist(self, state_path: Path) -> None:
         st = self._st
         st.weights = self._plasticity.weights.copy()
+        st.pending = (
+            self._pending_book.pending_orders() if self._pending_book is not None else []
+        )
         st.eligibility = self._plasticity.eligibility.copy()
         st.habituation = self._plasticity.habituation.copy()
         st.sim_v = self._sim._v.copy()
@@ -845,11 +928,9 @@ class AdultRun:
     def _order(
         self,
         ts: pd.Timestamp,
-        ticker: str,
-        side: str,
-        reason: str,
-        shares: int,
+        o: PendingOrder,
         price: float,
+        shares: int,
         realized_pnl: float | None,
         cash_after: float,
     ) -> None:
@@ -859,9 +940,10 @@ class AdultRun:
             {
                 "type": "order",
                 "ts": ts.isoformat(),
-                "ticker": ticker,
-                "side": side,
-                "reason": reason,
+                "decision_ts": o.decision_ts.isoformat(),
+                "ticker": o.ticker,
+                "side": o.side,
+                "reason": o.reason,
                 "shares": shares,
                 "price": round(price, 6),
                 "realized_pnl": None if realized_pnl is None else round(realized_pnl, 6),
@@ -870,8 +952,49 @@ class AdultRun:
             }
         )
 
+    def _cancel(self, o: PendingOrder, ts: pd.Timestamp, cancel_reason: str) -> None:
+        self._emit(
+            {
+                "type": "cancel",
+                "ts": ts.isoformat(),
+                "decision_ts": o.decision_ts.isoformat(),
+                "ticker": o.ticker,
+                "side": o.side,
+                "reason": o.reason,
+                "cancel_reason": cancel_reason,
+            }
+        )
+
+    def _apply_buy(self, ts: pd.Timestamp, o: PendingOrder, price: float) -> None:
+        """Buy/add fill on the paper book (loop parity with ``apply_buy``)."""
+        st = self._st
+        shares = o.shares
+        st.cash -= shares * price * (1.0 + self._cfg.fees)
+        pos = st.positions.get(o.ticker)
+        if pos is None:
+            st.positions[o.ticker] = _Position(shares=shares, avg_cost=price)
+        else:
+            total = pos.shares + shares
+            pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total
+            pos.shares = total
+        self._order(ts, o, price, shares, None, st.cash)
+
+    def _apply_sell(self, ts: pd.Timestamp, o: PendingOrder, price: float) -> float | None:
+        """Close the WHOLE current position (loop parity with ``apply_sell``);
+        returns realized P&L, or ``None`` when there is nothing left to sell."""
+        st = self._st
+        pos = st.positions.pop(o.ticker, None)
+        if pos is None:
+            return None
+        proceeds = pos.shares * price * (1.0 - self._cfg.fees)
+        st.cash += proceeds
+        realized = proceeds - pos.shares * pos.avg_cost
+        self._order(ts, o, price, pos.shares, realized, st.cash)
+        return realized
+
     def _close_position(self, ts: pd.Timestamp, ticker: str, reason: str) -> float:
-        """Sell a position; fills via the broker seam; returns realized P&L."""
+        """Immediate close at the last close via the broker seam (live seam,
+        close mode, and death liquidation); returns realized P&L."""
         st = self._st
         price = st.last_close[ticker]
         pos = st.positions.pop(ticker)
@@ -882,7 +1005,14 @@ class AdultRun:
         proceeds = pos.shares * fill * (1.0 - self._cfg.fees)
         st.cash += proceeds
         realized = proceeds - pos.shares * pos.avg_cost
-        self._order(ts, ticker, "sell", reason, pos.shares, fill, realized, st.cash)
+        self._order(
+            ts,
+            PendingOrder(decision_ts=ts, ticker=ticker, side="sell", reason=reason),
+            fill,
+            pos.shares,
+            realized,
+            st.cash,
+        )
         return realized
 
     def _settle_and_sleep(self, day) -> None:
@@ -926,11 +1056,25 @@ class AdultRun:
         ``loop.run_backtest`` bar-for-bar with the loop's pure seams."""
         cfg, st = self._cfg, self._st
 
-        # 1. Mark prices (fills and marks are at this bar's close).
+        # 1. Mark prices (equity marking stays at close prices — marking is
+        # not execution), then fill pending orders whose symbol's next
+        # available bar is this one (pessimistic next-bar model; loop parity).
         for ticker, df in frames.items():
             i = df.index.get_indexer([ts], method="pad")[0]
             if i >= 0 and df.index[i] == ts:
                 st.last_close[ticker] = float(df["close"].iloc[i])
+
+        # 1b. Pending-order fills (loop parity with run_backtest step 1b).
+        if self._pending_book is not None:
+            for o, fill_price in self._pending_book.drain(ts):
+                if o.side == "buy":
+                    self._apply_buy(ts, o, fill_price)
+                    continue
+                realized = self._apply_sell(ts, o, fill_price)
+                if realized is None:
+                    self._cancel(o, ts, "no_position")
+                else:
+                    st.day_realized += realized
 
         # 2. Mechanical exits, independent of encounters (DESIGN §6.5).
         for ticker in sorted(st.positions):
@@ -938,7 +1082,19 @@ class AdultRun:
             price = st.last_close[ticker]
             pnl_pct = (price / pos.avg_cost - 1.0) * 100.0
             if pnl_pct <= -cfg.shock_adverse_pct:
-                st.day_realized += self._close_position(ts, ticker, "shock")
+                if self._pending_book is not None:
+                    if not self._pending_book.has_pending(ticker):
+                        # Queue the stop-loss: it lands one bar later (the
+                        # execution delay is the point — no look-ahead
+                        # compensation).
+                        self._pending_book.submit(
+                            PendingOrder(
+                                decision_ts=ts, ticker=ticker, side="sell",
+                                reason="shock",
+                            )
+                        )
+                else:
+                    st.day_realized += self._close_position(ts, ticker, "shock")
         st.equity = self._equity_at()
         drawdown = max(0.0, 1.0 - st.equity / st.hatch_equity)
         if drawdown >= cfg.hunger_drawdown and st.hunger_armed:
@@ -950,8 +1106,19 @@ class AdultRun:
                 key=lambda t: (-t[1], t[0]),
             )
             if winners and winners[0][1] > 0.0:
-                st.day_realized += self._close_position(ts, winners[0][0], "hunger")
-                st.hunger_armed = False
+                winner = winners[0][0]
+                if self._pending_book is not None:
+                    if not self._pending_book.has_pending(winner):
+                        self._pending_book.submit(
+                            PendingOrder(
+                                decision_ts=ts, ticker=winner, side="sell",
+                                reason="hunger",
+                            )
+                        )
+                        st.hunger_armed = False
+                else:
+                    st.day_realized += self._close_position(ts, winner, "hunger")
+                    st.hunger_armed = False
         elif drawdown < 0.5 * cfg.hunger_drawdown:
             st.hunger_armed = True
 
@@ -1025,13 +1192,15 @@ class AdultRun:
                 }
             )
 
-            # 6. Decision + order (fills at this bar's close via the seam).
+            # 6. Decision + order (fills on the symbol's next available bar).
             held = ticker in st.positions
             price = st.last_close[ticker]
             action, reason = _decide(
                 centered,
                 held,
-                len(st.positions) >= cfg.position_cap,
+                len(st.positions) + (
+                    self._pending_book.n_buys() if self._pending_book is not None else 0
+                ) >= cfg.position_cap,
                 cfg.approach_thr,
                 cfg.avoid_thr,
             )
@@ -1051,25 +1220,28 @@ class AdultRun:
                     "reason": reason,
                 }
             )
-            if action == "buy":
-                fill = self._execution.execute(ts, ticker, "buy", shares, price)
-                if fill is not None:
-                    cost = shares * fill * (1.0 + cfg.fees)
-                    st.cash -= cost
-                    st.positions[ticker] = _Position(shares=shares, avg_cost=fill)
-                    self._order(ts, ticker, "buy", reason, shares, fill, None, st.cash)
-            elif action == "add":
-                fill = self._execution.execute(ts, ticker, "buy", shares, price)
-                if fill is not None:
-                    cost = shares * fill * (1.0 + cfg.fees)
-                    st.cash -= cost
-                    pos = st.positions[ticker]
-                    total = pos.shares + shares
-                    pos.avg_cost = (pos.avg_cost * pos.shares + shares * fill) / total
-                    pos.shares = total
-                    self._order(ts, ticker, "buy", reason, shares, fill, None, st.cash)
+            if action in ("buy", "add"):
+                o = PendingOrder(
+                    decision_ts=ts, ticker=ticker, side="buy", reason=reason,
+                    shares=shares,
+                )
+                if self._pending_book is not None:
+                    self._pending_book.submit(o)
+                else:
+                    fill = self._execution.execute(ts, ticker, "buy", shares, price)
+                    if fill is not None:
+                        self._apply_buy(ts, o, fill)
             elif action == "sell":
-                st.day_realized += self._close_position(ts, ticker, reason)
+                if self._pending_book is not None:
+                    # Sells close the WHOLE position at fill time.
+                    self._pending_book.submit(
+                        PendingOrder(
+                            decision_ts=ts, ticker=ticker, side="sell",
+                            reason=reason,
+                        )
+                    )
+                else:
+                    st.day_realized += self._close_position(ts, ticker, reason)
 
         # 7. Death check (D14): equity <= hatch * (1 + threshold) kills the fly.
         st.equity = self._equity_at()
@@ -1085,6 +1257,9 @@ class AdultRun:
             st.n_deaths += 1
             for ticker in sorted(st.positions):
                 st.day_realized += self._close_position(ts, ticker, "death_liquidation")
+            if self._pending_book is not None:
+                for o in self._pending_book.cancel_all():
+                    self._cancel(o, ts, "death")  # the brain that placed them is gone
             self._plasticity = Plasticity(self._chassis)
             self._sim.reset(cfg.seed)
             st.daily_spikes.fill(0)
