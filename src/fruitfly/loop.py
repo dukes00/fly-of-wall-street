@@ -194,6 +194,10 @@ class BacktestConfig:
     dt_ms: float = DT_MS
     #: Override the artifact directory (tests use this to avoid collisions).
     out_dir: str | Path | None = None
+    #: Restored plasticity (T9 larval training): initial KC→MBON weights,
+    #: shape-(n_kc, n_mbon) float64 (e.g. ``load_larval_weights`` output).
+    #: ``None`` (default) keeps the structural baseline — behavior unchanged.
+    initial_weights: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.top_k < 1:
@@ -219,6 +223,10 @@ class RunResult:
     n_deaths: int
     final_equity: float
     wall_s: float
+    #: Final KC→MBON weights of the last-hatched fly (T9 larval training
+    #: reads this to persist ``data/fly-larval-weights.npz``). A fresh,
+    #: never-trained run returns the structural baseline.
+    final_weights: np.ndarray | None = None
 
 
 @dataclass
@@ -361,6 +369,14 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     chassis = _load_chassis()
     plasticity = Plasticity(chassis)
     sim = LIFSim(chassis, dt_ms=config.dt_ms, seed=config.seed)
+    if config.initial_weights is not None:
+        restored = np.asarray(config.initial_weights, dtype=np.float64)
+        if restored.shape != plasticity.weights.shape:
+            raise ValueError(
+                f"initial_weights shape {restored.shape} does not match the "
+                f"chassis KC→MBON view {plasticity.weights.shape}"
+            )
+        plasticity.weights[...] = restored
     # The loop owns the only RNG: seeded noise floor + daily rotation offsets.
     rng = np.random.Generator(np.random.PCG64(config.seed))
 
@@ -434,6 +450,8 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     pointer = 0
     pointer_drawn = False
     daily_spikes = np.zeros(n, dtype=np.int64)
+    daily_mbon_drive = np.zeros(mbon_rows.size, dtype=np.float64)
+    daily_signal_encounters = 0
     day_realized = 0.0
     day_abs_ret_sum = 0.0
     day_abs_ret_n = 0
@@ -461,6 +479,7 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     def settle_and_sleep(day: date) -> None:
         """Close-of-day: sugar/shock settle -> observe -> sleep (DESIGN §7.3)."""
         nonlocal day_realized, day_abs_ret_sum, day_abs_ret_n, hunger_armed
+        nonlocal daily_mbon_drive, daily_signal_encounters
         reward = max(0.0, day_realized) / hatch_equity
         punishment = max(0.0, -day_realized) / hatch_equity
         drawdown = max(0.0, 1.0 - equity / hatch_equity)
@@ -470,9 +489,17 @@ def run_backtest(config: BacktestConfig) -> RunResult:
         state = NeuromodState(
             reward=reward, punishment=punishment, hunger=hunger, arousal=arousal
         )
-        plasticity.observe(
-            state, daily_spikes.astype(np.float64), daily_spikes.astype(np.float64)
-        )
+        # T9 un-silencing: raw MBON spikes are always zero at the current
+        # engine gains (T7 gap), which would keep the plasticity eligibility
+        # trace at zero forever — learning could never happen. Post activity
+        # is therefore the day's mean STRUCTURAL MBON response
+        # (``baseline.T @`` KC activity — the MBON's innate receptive field),
+        # averaged over signal-bearing encounters. Weight-independent, so
+        # the three-factor update cannot feed back into itself.
+        post = np.zeros(n, dtype=np.float64)
+        if daily_signal_encounters:
+            post[mbon_rows] = daily_mbon_drive / daily_signal_encounters
+        plasticity.observe(state, daily_spikes.astype(np.float64), post)
         emit(
             {
                 "type": "sugar_shock",
@@ -489,6 +516,8 @@ def run_backtest(config: BacktestConfig) -> RunResult:
         day_abs_ret_sum = 0.0
         day_abs_ret_n = 0
         daily_spikes.fill(0)
+        daily_mbon_drive.fill(0)
+        daily_signal_encounters = 0
         hunger_armed = True
 
     for ts in timeline:
@@ -571,6 +600,20 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                 approach_drive + avoid_drive + 1e-9
             )
             raw_score = float(valence @ drive)
+            if approach_drive + avoid_drive > 0.0:
+                # Eligibility post-activity: the STRUCTURAL MBON response
+                # (baseline.T x KC activity — the MBON's innate receptive
+                # field), not the learned drive. The learned drive is
+                # proportional to the current weights, so using it as the
+                # eligibility input is a positive feedback loop (delta ∝ W,
+                # verified to explode over 20 training days); the structural
+                # response is weight-independent and O(1-10) on the real
+                # chassis (mean 2.85 per encounter), keeping daily deltas
+                # bounded by the dopamine gate.
+                daily_mbon_drive += plasticity.baseline.T @ plasticity.kc_activity(
+                    spike_f
+                )
+                daily_signal_encounters += 1
             duration_s = config.ms_per_bar / 1000.0
             mbon_rate = float(spikes[mbon_rows].sum()) / mbon_rows.size / duration_s
             # Center on the innate balance; a silent encounter (no KC
@@ -648,6 +691,8 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             plasticity = Plasticity(chassis)
             sim.reset(config.seed)
             daily_spikes.fill(0)
+            daily_mbon_drive.fill(0)
+            daily_signal_encounters = 0
             hatch_equity = cash
             hunger_armed = True
             emit({"type": "hatch", "hatch_equity": round(hatch_equity, 6)})
@@ -679,6 +724,7 @@ def run_backtest(config: BacktestConfig) -> RunResult:
         n_deaths=n_deaths,
         final_equity=equity,
         wall_s=time.perf_counter() - t0,
+        final_weights=plasticity.weights.copy(),
     )
 
 
