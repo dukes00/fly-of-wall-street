@@ -55,7 +55,10 @@ import argparse
 import hashlib
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    import pandas as pd
 from fruitfly.connectome import load_stripped_chassis, load_whole_fly
 from fruitfly.loop import BacktestConfig, run_backtest
 from fruitfly.train import load_larval_weights
@@ -185,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.std_beta is not None:
         return _main_std(args, artifact, transplant)
 
+    config = dict(seed=args.seed, start=args.start, end=args.end,
+                  out_dir=None)  # out_dir set per run below
     stripped_cfg_a = BacktestConfig(
         **{**config, "out_dir": RUN_DIRS["stripped_a"],
            "initial_weights": artifact.weights}
@@ -242,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _std_bars() -> list[tuple[str, "pd.Timestamp", "pd.DataFrame", int, dict]]:
+def _std_bars() -> list[tuple[str, pd.Timestamp, pd.DataFrame, int, dict]]:
     """Real replayed bars for STD calibration: the DIAG bar plus evenly
     spaced 2026-09-11 session bars of the same ticker. Deterministic."""
     import numpy as np
