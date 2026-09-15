@@ -308,6 +308,31 @@ def test_kc_activity_slices_kc_rows(chassis):
 
 # --- per-exit credit assignment (observe_trade) ---------------------------------
 
+def test_eligibility_driver_is_the_observe_trace_increment(chassis):
+    """``eligibility_driver`` is the exact increment a zero-gate ``observe``
+    adds to the trace, and it mutates nothing — the loop composes intraday
+    traces from these drivers because ``sleep()`` consumes the live trace
+    (the live trace is always all-zero intraday)."""
+    p = Plasticity(chassis)
+    pre, post = spikes({KC0: 1.0, KC1: 2.0}), spikes({MBON0: 1.0, MBON2: 3.0})
+    driver = p.eligibility_driver(pre, post)
+    assert driver.shape == p.eligibility.shape
+    # Purity: no habituation decay, no trace accumulation.
+    assert not p.eligibility.any()
+    assert (p.habituation == 1.0).all()
+    # Reference: observe with reward=punishment=0 accumulates exactly the
+    # driver into a zero trace (same decay path, same op order).
+    p.observe(NeuromodState(), pre, post)
+    assert np.array_equal(p.eligibility, driver)
+    # Composition: stacking the next driver with the caller-side decay
+    # reproduces observe's own two-step trace byte for byte.
+    driver2 = p.eligibility_driver(pre, post)
+    p.observe(NeuromodState(), pre, post)
+    assert np.array_equal(
+        p.eligibility, p.eligibility_decay * driver + driver2
+    )
+
+
 
 def test_observe_trade_matches_observe_on_same_trace(chassis):
     """Reward-gated snapshot credit equals what observe does on the same trace."""

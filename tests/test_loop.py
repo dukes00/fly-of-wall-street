@@ -694,6 +694,44 @@ class TestPerExitDopamine:
         assert not np.array_equal(with_close.final_weights,
                                   without_close.final_weights)
 
+    def test_credit_snapshot_is_real_intraday_eligibility(
+        self, patched, monkeypatch, tmp_path
+    ):
+        """The per-exit credit moves weights through the ENTRY SNAPSHOT, not
+        sequence noise: a reference run with the SAME trades but
+        ``observe_trade`` neutralized (everything else identical) ends with
+        different weights than the credited run. This is only possible if
+        the snapshot taken at the buy was nonzero — the loop's intraday
+        trace, not the always-zero live ``plasticity.eligibility``."""
+        import fruitfly.neuromod as neuromod
+
+        loop = patched
+        monkeypatch.setattr(loop, "_decide", _counter_stub(do_close=True))
+        with_close = run_backtest(
+            _config(7, tmp_path / "close", fill_mode="close")
+        )
+        credits = [
+            e for e in _events(with_close.run_dir / "events.jsonl")
+            if e["type"] == "trade_credit"
+        ]
+        assert len(credits) == 1
+        # Same trades, same encounters, same daily ritual — the ONLY
+        # difference is that the credit's three-factor update is a no-op.
+        # A FRESH stub instance: the stub carries per-run state, so sharing
+        # one across runs would change decisions for the wrong reason.
+        monkeypatch.setattr(loop, "_decide", _counter_stub(do_close=True))
+        monkeypatch.setattr(
+            neuromod.Plasticity,
+            "observe_trade",
+            lambda self, state, eligibility_snapshot: None,
+        )
+        noop_credit = run_backtest(
+            _config(7, tmp_path / "noop", fill_mode="close")
+        )
+        assert not np.array_equal(
+            with_close.final_weights, noop_credit.final_weights
+        )
+
 
 class TestDailyAnchorRefresh:
     def test_anchor_emitted_each_day_and_centering_uses_refreshed_anchor(

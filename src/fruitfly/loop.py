@@ -715,6 +715,15 @@ def run_backtest(config: BacktestConfig) -> RunResult:
     pointer_drawn = False
     daily_spikes = np.zeros(n, dtype=np.int64)
     daily_mbon_drive = np.zeros(mbon_rows.size, dtype=np.float64)
+    # Intraday eligibility trace (DESIGN v0.6 D6 fix): the live
+    # ``plasticity.eligibility`` trace is consumed (zeroed) by ``sleep()``
+    # and only advanced by the daily ``observe()``, so it is always
+    # all-zero intraday. The loop therefore composes its own trace from the
+    # pure ``Plasticity.eligibility_driver`` increments — this is the trace
+    # a buy snapshots for the per-exit credit.
+    intraday_elig = np.zeros(
+        (plasticity.kc_index.size, plasticity.mbon_index.size), dtype=np.float64
+    )
     daily_signal_encounters = 0
     day_realized = 0.0
     day_abs_ret_sum = 0.0
@@ -742,11 +751,14 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             total = pos.shares + shares
             pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total
             pos.shares = total
-        # Snapshot the eligibility trace for this position's opening
-        # encounter (DESIGN v0.6 D6). Overwritten on add — the latest
-        # snapshot wins, because the realized P&L at close is credited to
-        # the most recent entry decision for the position.
-        entry_elig[o.ticker] = plasticity.eligibility.copy()
+        # Snapshot the INTRADAY eligibility trace for this position's
+        # opening encounter (DESIGN v0.6 D6). Overwritten on add — the
+        # latest snapshot wins, because the realized P&L at close is
+        # credited to the most recent entry decision for the position.
+        # Not ``plasticity.eligibility``: the live trace is zero intraday
+        # (sleep consumes it; only the daily observe advances it), so the
+        # loop's intraday trace is the real eligibility source.
+        entry_elig[o.ticker] = intraday_elig.copy()
         order(ts, o, price, shares, None, cash)
 
     def apply_sell(ts: pd.Timestamp, o: PendingOrder, price: float) -> float | None:
@@ -842,6 +854,9 @@ def run_backtest(config: BacktestConfig) -> RunResult:
         )
         plasticity.sleep()
         emit({"type": "sleep", "ts": f"{day}T20:00:00+00:00"})
+        # Sleep consumes the intraday trace along with the live one: the
+        # day's co-activity is consolidated, tomorrow starts fresh.
+        intraday_elig.fill(0.0)
         # Daily anchor refresh (DESIGN v0.6 T9): re-measure the innate
         # balance with the current (learned) weights — one extra neutral
         # sniff per sleep, deterministic (RNG-free) — so learned drift in
@@ -990,10 +1005,20 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                 # response is weight-independent and O(1-10) on the real
                 # chassis (mean 2.85 per encounter), keeping daily deltas
                 # bounded by the dopamine gate.
-                daily_mbon_drive += plasticity.baseline.T @ plasticity.kc_activity(
+                structural_post = plasticity.baseline.T @ plasticity.kc_activity(
                     spike_f
                 )
+                daily_mbon_drive += structural_post
                 daily_signal_encounters += 1
+                # Intraday eligibility: decay the trace, add this
+                # encounter's driver — the exact increment a zero-gate
+                # ``observe`` would apply (habituation is untouched
+                # intraday, so the drivers track the live trace's path).
+                post = np.zeros(n, dtype=np.float64)
+                post[mbon_rows] = structural_post
+                intraday_elig = plasticity.eligibility_decay * intraday_elig + (
+                    plasticity.eligibility_driver(spike_f, post)
+                )
             duration_s = config.ms_per_bar / 1000.0
             mbon_rate = float(spikes[mbon_rows].sum()) / mbon_rows.size / duration_s
             # Center on the innate balance; a silent encounter (no KC
@@ -1096,6 +1121,7 @@ def run_backtest(config: BacktestConfig) -> RunResult:
             sim.reset(config.seed)
             daily_spikes.fill(0)
             daily_mbon_drive.fill(0)
+            intraday_elig.fill(0.0)  # fresh brain = fresh trace
             daily_signal_encounters = 0
             hatch_equity = cash
             hunger_armed = True

@@ -297,6 +297,7 @@ _ARRAY_MEMBERS = (
     "habituation",
     "daily_spikes",
     "daily_mbon_drive",
+    "intraday_elig",
     "sim_v",
     "sim_refr",
     "sim_prev",
@@ -339,6 +340,11 @@ class FlyState:
     # Daily accumulators (reset by settle_and_sleep).
     daily_spikes: np.ndarray | None = None
     daily_mbon_drive: np.ndarray | None = None
+    #: Intraday eligibility trace (DESIGN v0.6 D6 fix, loop parity): the
+    #: live ``plasticity.eligibility`` is always all-zero intraday (sleep
+    #: consumes it), so the driver composes this trace per encounter and a
+    #: buy snapshots it for the per-exit credit.
+    intraday_elig: np.ndarray | None = None
     daily_signal_encounters: int = 0
     day_realized: float = 0.0
     day_abs_ret_sum: float = 0.0
@@ -838,6 +844,10 @@ class AdultRun:
             st.equity = cfg.initial_cash
             st.daily_spikes = np.zeros(self._n, dtype=np.int64)
             st.daily_mbon_drive = np.zeros(self._mbon_rows.size, dtype=np.float64)
+            st.intraday_elig = np.zeros(
+                (plasticity.kc_index.size, plasticity.mbon_index.size),
+                dtype=np.float64,
+            )
             if cfg.larval_weights is not None:
                 lw = load_larval_weights(cfg.larval_weights, chassis)  # fingerprint guard
                 plasticity.weights[...] = lw.weights
@@ -1015,10 +1025,15 @@ class AdultRun:
             total = pos.shares + shares
             pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total
             pos.shares = total
-        # Snapshot the eligibility trace for this position's opening
-        # encounter (DESIGN v0.6 D6); overwritten on add — the latest
-        # snapshot wins (loop parity with ``apply_buy``).
-        st.entry_elig[o.ticker] = self._plasticity.eligibility.copy()
+        # Snapshot the INTRADAY eligibility trace for this position's
+        # opening encounter (DESIGN v0.6 D6); overwritten on add — the
+        # latest snapshot wins, because the realized P&L at close is
+        # credited to the most recent entry decision for the position.
+        # Not ``plasticity.eligibility``: the live trace is zero intraday
+        # (sleep consumes it; only the daily observe advances it), so the
+        # composed intraday trace is the real eligibility source (loop
+        # parity with ``apply_buy``).
+        st.entry_elig[o.ticker] = st.intraday_elig.copy()
         self._order(ts, o, price, shares, None, st.cash)
 
     def _apply_sell(self, ts: pd.Timestamp, o: PendingOrder, price: float) -> float | None:
@@ -1133,6 +1148,9 @@ class AdultRun:
         )
         self._plasticity.sleep()
         self._emit({"type": "sleep", "ts": f"{day}T20:00:00+00:00"})
+        # Sleep consumes the intraday trace along with the live one (loop
+        # parity with ``settle_and_sleep``).
+        st.intraday_elig.fill(0.0)
         st.day_realized = 0.0
         st.day_abs_ret_sum = 0.0
         # Daily anchor refresh (DESIGN v0.6 T9): re-measure the innate
@@ -1267,10 +1285,19 @@ class AdultRun:
             raw_score = float(valence @ drive)
             if approach_drive + avoid_drive > 0.0:
                 # Eligibility post-activity: the STRUCTURAL MBON response.
-                st.daily_mbon_drive += (
-                    self._plasticity.baseline.T @ self._plasticity.kc_activity(spike_f)
+                structural_post = self._plasticity.baseline.T @ (
+                    self._plasticity.kc_activity(spike_f)
                 )
+                st.daily_mbon_drive += structural_post
                 st.daily_signal_encounters += 1
+                # Intraday eligibility: decay + this encounter's driver —
+                # the exact increment a zero-gate ``observe`` would apply
+                # (loop parity with run_backtest).
+                post = np.zeros(self._n, dtype=np.float64)
+                post[self._mbon_rows] = structural_post
+                st.intraday_elig = self._plasticity.eligibility_decay * (
+                    st.intraday_elig
+                ) + self._plasticity.eligibility_driver(spike_f, post)
             duration_s = cfg.ms_per_bar / 1000.0
             mbon_rate = (
                 float(spikes[self._mbon_rows].sum()) / self._mbon_rows.size / duration_s
@@ -1382,6 +1409,7 @@ class AdultRun:
             self._sim.reset(cfg.seed)
             st.daily_spikes.fill(0)
             st.daily_mbon_drive.fill(0)
+            st.intraday_elig.fill(0.0)  # fresh brain = fresh trace
             st.daily_signal_encounters = 0
             st.hatch_equity = st.cash
             st.hunger_armed = True

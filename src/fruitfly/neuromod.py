@@ -178,6 +178,29 @@ class Plasticity:
         """Slice a full node-length activity array down to the KC rows."""
         return self._slice(pre_spikes, self.kc_index, "pre_spikes")
 
+    def eligibility_driver(
+        self, pre_spikes: np.ndarray, post_spikes: np.ndarray
+    ) -> np.ndarray:
+        """The exact eligibility increment one presentation contributes.
+
+        Habituation-gated KC (pre) × MBON (post) co-activity, masked to the
+        structural support — the same driver ``observe`` accumulates (with
+        the per-observe ``eligibility_decay`` applied by the caller, exactly
+        as ``observe`` does to the live trace). Pure: reads the current
+        habituation factors, mutates NOTHING (not habituation, not the live
+        trace), so the caller can compose its own trace.
+
+        The backtest loop composes intraday traces from these drivers
+        because the live trace is consumed (zeroed) by ``sleep()`` — it is
+        always all-zero intraday, and the per-exit ``observe_trade`` credit
+        needs the trace as it stood at the opening encounter.
+
+        Deterministic: float64, no RNG, fixed op order.
+        """
+        x = self.kc_activity(pre_spikes)
+        y = self._slice(post_spikes, self.mbon_index, "post_spikes")
+        return (x * self._habituation)[:, None] * y[None, :] * self.support
+
     # ------------------------------------------------------------------ gate
     def reward_drive(self, state: NeuromodState) -> float:
         """PAM drive: reward scaled up by hunger (drawdown → risk appetite)."""
@@ -207,7 +230,6 @@ class Plasticity:
         trial.
         """
         x = self.kc_activity(pre_spikes)
-        y = self._slice(post_spikes, self.mbon_index, "post_spikes")
 
         d = self._gate(state)
         salient = abs(d) > 0.0
@@ -219,8 +241,7 @@ class Plasticity:
 
         # Eligibility trace: habituation-gated pre×post co-activity, masked to
         # structural support, decaying per observe.
-        driver = (x * self._habituation)[:, None] * y[None, :]
-        driver *= self.support
+        driver = self.eligibility_driver(pre_spikes, post_spikes)
         eligibility = self.eligibility_decay * self._eligibility + driver
 
         if salient:
