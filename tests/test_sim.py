@@ -293,3 +293,116 @@ class TestApi:
         sim.step(constant_input(1, 0, 30.0), duration_ms=10.0)
         assert (sim.spikes >= c1).all()
         assert sim.spikes.sum() > c1.sum()
+
+
+# ---------------------------------------------------------------------------
+# Opt-in short-term synaptic depression (STD)
+# ---------------------------------------------------------------------------
+
+
+class TestStd:
+    """std_beta/std_tau_rec_ms: fatigue under sustained inhibitory firing,
+    exact-exponential recovery, excitatory pathways untouched, determinism,
+    and default-off bit-identity with the pre-STD engine."""
+
+    DT = 0.5
+    #: 3 nodes: 0 = inhibitory presynaptic, 1 = excitatory presynaptic,
+    #: 2 = shared postsynaptic target.
+    SIGNS = [-1, 1, 0]
+    EDGES = [(0, 2, 500), (1, 2, 500)]
+
+    def _drive_inhibitory(self, steps: int, **std) -> tuple[LIFSim, np.ndarray]:
+        sim = LIFSim(make_chassis(self.SIGNS, self.EDGES), dt_ms=self.DT, seed=0,
+                     **std)
+        inp = constant_input(3, 0, 20.0)
+        vs = np.array([sim.step(inp, self.DT) and sim._v[2]
+                       for _ in range(steps)])
+        return sim, vs
+
+    def test_default_off_is_bit_identical(self):
+        """No STD kwargs == explicit std off: identical state and spikes."""
+        ch = make_chassis(self.SIGNS, self.EDGES)
+        rng = np.random.default_rng(3)
+        inp = rng.standard_normal(3)
+        for std_kw in ({}, {"std_beta": None, "std_tau_rec_ms": None}):
+            ref = LIFSim(ch, dt_ms=self.DT, seed=0)
+            sim = LIFSim(ch, dt_ms=self.DT, seed=0, **std_kw)
+            assert sim.std_beta is None and sim.std_tau_rec_ms is None
+            for _ in range(50):
+                sim.step(inp, self.DT)
+                ref.step(inp, self.DT)
+            assert sim._v.tobytes() == ref._v.tobytes()
+            assert sim.spikes.tobytes() == ref.spikes.tobytes()
+
+    def test_fatigues_under_sustained_inhibitory_firing(self):
+        """Sustained inhibitory bombardment inhibits the target less with
+        STD than without, and the delivered inhibition keeps shrinking."""
+        _, vs_off = self._drive_inhibitory(300)
+        _, vs_on = self._drive_inhibitory(300, std_beta=0.3, std_tau_rec_ms=50.0)
+        assert vs_on[-50:].mean() > vs_off[-50:].mean()  # less hyperpolarized
+        # and still weakening across the train: the deepest hyperpolarization
+        # (full-strength, undepressed inhibition) occurs in the early half.
+        assert vs_on[:150].min() < vs_on[150:].min()
+
+    def test_recovery_follows_exact_exponential_form(self):
+        """After a silent pause, f[i] == 1 - (1 - f0) * exp(-t/tau_rec)."""
+        sim = LIFSim(make_chassis(self.SIGNS, self.EDGES), dt_ms=self.DT,
+                     seed=0, std_beta=0.5, std_tau_rec_ms=20.0)
+        sim.step(constant_input(3, 0, 20.0), duration_ms=50.0)
+        f0 = float(sim._f[0])
+        assert f0 < 1.0
+        pause_ms = 100.0
+        sim.step(None, duration_ms=pause_ms)
+        expected = 1.0 - (1.0 - f0) * np.exp(-pause_ms / 20.0)
+        assert float(sim._f[0]) == pytest.approx(expected, rel=1e-12)
+
+    def test_excitatory_pathway_unaffected(self):
+        """With STD on, a purely excitatory drive reproduces the STD-off
+        membrane trace bit-for-bit."""
+        ch = make_chassis(self.SIGNS, self.EDGES)
+        inp = constant_input(3, 1, 25.0)  # excitatory presynaptic only
+        off = LIFSim(ch, dt_ms=self.DT, seed=0)
+        on = LIFSim(ch, dt_ms=self.DT, seed=0,
+                    std_beta=0.4, std_tau_rec_ms=30.0)
+        for _ in range(120):
+            off.step(inp, self.DT)
+            on.step(inp, self.DT)
+        assert on._v.tobytes() == off._v.tobytes()
+        assert on.spikes.tobytes() == off.spikes.tobytes()
+
+    def test_double_run_bit_identical(self):
+        """Same params + input sequence: full state (v, spikes, factors)
+        bitwise identical across independent sims."""
+        ch = make_chassis(self.SIGNS, self.EDGES)
+        inp = constant_input(3, 0, 20.0)
+        runs = []
+        for _ in range(2):
+            sim = LIFSim(ch, dt_ms=self.DT, seed=0,
+                         std_beta=0.3, std_tau_rec_ms=50.0)
+            sim.step(inp, duration_ms=40.0)
+            sim.step(None, duration_ms=60.0)
+            sim.step(inp, duration_ms=40.0)
+            runs.append((sim._v.copy(), sim.spikes.copy(), sim._f.copy()))
+        assert runs[0][0].tobytes() == runs[1][0].tobytes()
+        assert runs[0][1].tobytes() == runs[1][1].tobytes()
+        assert runs[0][2].tobytes() == runs[1][2].tobytes()
+
+    def test_reset_restores_depression_factors(self):
+        sim = LIFSim(make_chassis(self.SIGNS, self.EDGES), dt_ms=self.DT,
+                     seed=0, std_beta=0.5, std_tau_rec_ms=20.0)
+        sim.step(constant_input(3, 0, 20.0), duration_ms=60.0)
+        sim.reset()
+        assert (sim._f == 1.0).all()
+
+    def test_param_validation(self):
+        ch = make_chassis([1], [])
+        with pytest.raises(ValueError):
+            LIFSim(ch, std_beta=0.3)  # tau missing
+        with pytest.raises(ValueError):
+            LIFSim(ch, std_tau_rec_ms=50.0)  # beta missing
+        with pytest.raises(ValueError):
+            LIFSim(ch, std_beta=0.0, std_tau_rec_ms=50.0)
+        with pytest.raises(ValueError):
+            LIFSim(ch, std_beta=1.0, std_tau_rec_ms=50.0)
+        with pytest.raises(ValueError):
+            LIFSim(ch, std_beta=0.3, std_tau_rec_ms=0.0)

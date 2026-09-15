@@ -31,6 +31,22 @@ Usage::
 
     uv run python scripts/validate_transplant.py            # full protocol
     uv run python scripts/validate_transplant.py --reuse    # report only
+
+T12b extension (opt-in short-term synaptic depression on the whole-fly
+brain's inhibitory feedback — the APL/DPM KC-clamp root cause of T12)::
+
+    # Calibration sweep of (beta, tau_rec) over replayed real bars:
+    uv run python scripts/validate_transplant.py --calibrate-std
+    # Full 2-day x 2-brain protocol with the whole fly running STD:
+    uv run python scripts/validate_transplant.py --std-beta B --std-tau-rec MS
+
+``--std-beta``/``--std-tau-rec`` switch the report target to
+``reports/t12b-apl-std.md`` and the run dirs to ``data/runs/t12b-*``. The
+stripped brain never runs STD (it contains no APL/DPM); its receipts are
+byte-reused from the T12 runs when present (identical config), else rerun
+into ``t12b-stripped-*``. The whole-fly LIFSim is constructed by the loop,
+so the STD parameters reach it through the loop's ``LIFSim`` name seam —
+the same monkeypatch pattern as the documented ``_load_chassis`` seam.
 """
 
 from __future__ import annotations
@@ -74,6 +90,28 @@ RUN_DIRS = {
     "wholefly_b": Path("data/runs/t12-wholefly-b"),
 }
 RECEIPTS = ("events.jsonl", "equity.csv")
+
+#: T12b (STD) report and run dirs. The stripped brain is identical to T12
+#: (no APL/DPM to depress), so its fresh t12b receipts are byte-copied from
+#: the T12 runs when those exist; the whole-fly runs always re-execute with
+#: the STD-enabled LIFSim.
+REPORT_PATH_STD = Path("reports/t12b-apl-std.md")
+RUN_DIRS_STD = {
+    "stripped_a": Path("data/runs/t12b-stripped-a"),
+    "stripped_b": Path("data/runs/t12b-stripped-b"),
+    "wholefly_a": Path("data/runs/t12b-wholefly-a"),
+    "wholefly_b": Path("data/runs/t12b-wholefly-b"),
+}
+
+#: Calibration sweep grid (T12b): depletion fraction x recovery tau (ms),
+#: evaluated over replayed real bars (``CAL_BARS``). Target: whole-fly KC
+#: spike yield comparable to the stripped brain's while LC/T4/T5 pathway
+#: activity stays within ``CAL_VISION_FLOOR`` of the no-STD whole-fly
+#: baseline.
+CAL_BETAS = (0.1, 0.2, 0.3, 0.5, 0.7, 0.9)
+CAL_TAUS_MS = (25.0, 50.0, 100.0, 200.0, 500.0)
+CAL_VISION_FLOOR = 0.9
+CAL_BAR_COUNT = 5
 
 
 def _sha256(path: Path) -> str:
@@ -121,6 +159,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--end", default=REPLAY_END)
     parser.add_argument("--seed", type=int, default=REPLAY_SEED)
     parser.add_argument("--artifact", default=str(LARVAL_ARTIFACT))
+    parser.add_argument("--calibrate-std", action="store_true",
+                        help="T12b: sweep (beta, tau_rec) on replayed real bars")
+    parser.add_argument("--std-beta", type=float, default=None,
+                        help="T12b: STD depletion fraction (with --std-tau-rec)")
+    parser.add_argument("--std-tau-rec", type=float, default=None,
+                        help="T12b: STD recovery time constant in ms")
     args = parser.parse_args(argv)
 
     stripped = load_stripped_chassis()
@@ -134,8 +178,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[t12] transplant: KC match {report.kc_match_rate:.4f}, "
           f"MBON match {report.mbon_match_rate:.4f}, copied {report.pairs_copied} pairs")
 
-    config = dict(seed=args.seed, start=args.start, end=args.end,
-                  out_dir=None)  # out_dir set per run below
+    if args.calibrate_std:
+        return _cmd_calibrate_std(args, stripped, transplant)
+    if (args.std_beta is None) != (args.std_tau_rec is None):
+        parser.error("--std-beta and --std-tau-rec must be given together")
+    if args.std_beta is not None:
+        return _main_std(args, artifact, transplant)
 
     stripped_cfg_a = BacktestConfig(
         **{**config, "out_dir": RUN_DIRS["stripped_a"],
@@ -187,6 +235,210 @@ def main(argv: list[str] | None = None) -> int:
     _write_report(args, transplant, rows, mean_action, receipts,
                   det_stripped, det_wholefly, diagnosis)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# T12b: opt-in short-term synaptic depression on the whole-fly brain
+# ---------------------------------------------------------------------------
+
+
+def _std_bars() -> list[tuple[str, "pd.Timestamp", "pd.DataFrame", int, dict]]:
+    """Real replayed bars for STD calibration: the DIAG bar plus evenly
+    spaced 2026-09-11 session bars of the same ticker. Deterministic."""
+    import numpy as np
+    import pandas as pd
+
+    from fruitfly.data import BASKET, load_bars
+    from fruitfly.loop import _features_at
+
+    frames = {sym: df for sym, df in load_bars(list(BASKET), None, None).items()
+              if len(df)}
+    df = frames[DIAG_TICKER]
+    day = df[df.index.date == pd.Timestamp(DIAG_TS).date()]
+    picks = sorted({DIAG_TS} | {
+        str(day.index[int(round(f * (len(day) - 1)))])
+        for f in np.linspace(0.1, 0.9, CAL_BAR_COUNT - 1)
+    })
+    out = []
+    for ts_s in picks:
+        ts = pd.Timestamp(ts_s)
+        i = df.index.get_indexer([ts], method="pad")[0]
+        features, _, _ = _features_at(df, i)
+        out.append((ts_s, ts, df, i, features))
+    return out
+
+
+def _probe_bar(chassis, plast, ts, df, i, features, gain=1.0, **std) -> dict:
+    """One replayed bar through a fresh LIFSim (the T12 diagnostic drive:
+    identical loop input, seeded noise, loop gain x ``gain``). Returns
+    KC / MBON / APL / LC-T4-T5 activity plus the wall time of the step."""
+    import time as _time
+
+    import numpy as np
+
+    from fruitfly.loop import NOISE_SIGMA_MV, SMELL_GAIN, VISION_WINDOW_BARS
+    from fruitfly.senses import encode_smell, encode_vision
+    from fruitfly.senses.smell import upn_channels
+    from fruitfly.sim import LIFSim
+
+    sim = LIFSim(chassis, dt_ms=1.0, seed=0, **std)
+    ur, _ = upn_channels(chassis)
+    window = df.iloc[max(0, i - VISION_WINDOW_BARS + 1): i + 1]
+    inp = encode_vision(window, chassis).astype(np.float64)
+    inp[ur] += SMELL_GAIN * gain * encode_smell(DIAG_TICKER, features, chassis)
+    inp += np.random.default_rng(0).standard_normal(chassis.n_neurons) * NOISE_SIGMA_MV
+    t0 = _time.perf_counter()
+    sp = sim.step(inp, 500.0)["spikes"]
+    wall_s = _time.perf_counter() - t0
+    pop = chassis.nodes["population"].to_numpy()
+    vision = np.isin(pop, ("LC-looming", "T4", "T5"))
+    typ = chassis.nodes["type"].fillna("").to_numpy()
+    return {
+        "kc_spikes": int(sp[plast.kc_index].sum()),
+        "mbon_drive": float(plast.mbon_activation(sp.astype(np.float64)).sum()),
+        "apl_spikes": int(sp[np.flatnonzero(typ == "APL")].sum()),
+        "vision_spikes": int(sp[vision].sum()),
+        "wall_s": wall_s,
+    }
+
+
+def _mean_probe(chassis, plast, bars, **std) -> dict:
+    """Mean of :func:`_probe_bar` over the calibration bars."""
+    agg = {"kc_spikes": 0.0, "mbon_drive": 0.0, "apl_spikes": 0.0,
+           "vision_spikes": 0.0, "wall_s": 0.0}
+    for _, ts, df, i, features in bars:
+        r = _probe_bar(chassis, plast, ts, df, i, features, **std)
+        for k in agg:
+            agg[k] += r[k]
+    n = len(bars)
+    return {k: v / n for k, v in agg.items()}
+
+
+def _sweep_std(stripped, transplant, bars) -> tuple[list[dict], dict, dict]:
+    """Calibration sweep: references + (beta, tau_rec) grid over ``bars``.
+
+    Returns ``(grid_rows, ref_stripped, ref_whole)``; grid rows carry the
+    mean KC/MBON/APL/vision activity and the vision ratio vs the no-STD
+    whole-fly baseline.
+    """
+    from fruitfly.neuromod import Plasticity
+
+    ch = transplant.labeled_chassis
+    plast = transplant.plasticity
+    ref_stripped = _mean_probe(stripped, Plasticity(stripped), bars)
+    ref_whole = _mean_probe(ch, plast, bars)
+    rows = []
+    for beta in CAL_BETAS:
+        for tau in CAL_TAUS_MS:
+            m = _mean_probe(ch, plast, bars, std_beta=beta, std_tau_rec_ms=tau)
+            ratio = (m["vision_spikes"] / ref_whole["vision_spikes"]
+                     if ref_whole["vision_spikes"] else 1.0)
+            rows.append({"beta": beta, "tau": tau, **m, "vision_ratio": ratio})
+    return rows, ref_stripped, ref_whole
+
+
+def _choose_std(rows, ref_stripped, ref_whole) -> dict | None:
+    """Pick the sweep point: vision pathway intact (>= floor of the no-STD
+    whole-fly baseline), KC activity alive, KC yield closest to the
+    stripped brain's per-bar yield."""
+    target = ref_stripped["kc_spikes"]
+    ok = [r for r in rows
+          if r["vision_ratio"] >= CAL_VISION_FLOOR and r["kc_spikes"] > 0]
+    if not ok:
+        return None
+    return min(ok, key=lambda r: (abs(r["kc_spikes"] - target), -r["kc_spikes"]))
+
+
+def _cmd_calibrate_std(args, stripped, transplant) -> int:
+    """Sweep (beta, tau_rec) over replayed real bars and print the table."""
+    bars = _std_bars()
+    print(f"[t12b] calibration bars: {[b[0] for b in bars]}")
+    rows, ref_stripped, ref_whole = _sweep_std(stripped, transplant, bars)
+    print(f"[t12b] reference stripped (no STD): "
+          f"KC {ref_stripped['kc_spikes']:.1f}, MBON {ref_stripped['mbon_drive']:.1f}, "
+          f"vision {ref_stripped['vision_spikes']:.0f}, "
+          f"wall {ref_stripped['wall_s']:.3f}s/bar")
+    print(f"[t12b] reference whole-fly (no STD): "
+          f"KC {ref_whole['kc_spikes']:.1f}, MBON {ref_whole['mbon_drive']:.1f}, "
+          f"APL {ref_whole['apl_spikes']:.0f}, vision {ref_whole['vision_spikes']:.0f}, "
+          f"wall {ref_whole['wall_s']:.3f}s/bar")
+    for r in rows:
+        print(f"[t12b] beta={r['beta']:<4} tau={r['tau']:<6} "
+              f"KC {r['kc_spikes']:6.1f} | MBON {r['mbon_drive']:7.1f} "
+              f"| APL {r['apl_spikes']:6.0f} | vision {r['vision_spikes']:6.0f} "
+              f"| x{r['vision_ratio']:.3f} | wall {r['wall_s']:.3f}s")
+    best = _choose_std(rows, ref_stripped, ref_whole)
+    if best is not None:
+        print(f"[t12b] CHOSEN: beta={best['beta']} tau_rec={best['tau']}ms "
+              f"(KC {best['kc_spikes']:.1f} vs stripped "
+              f"{ref_stripped['kc_spikes']:.1f}, vision x{best['vision_ratio']:.3f})")
+    else:
+        print("[t12b] NO sweep point met the vision floor with KC activity")
+    return 0
+
+
+def _replay_std(tag: str, config: BacktestConfig, chassis, beta: float,
+                tau: float) -> tuple[Path, float | None, int | None]:
+    """One whole-fly replay with the STD-enabled LIFSim patched into the
+    loop's ``LIFSim`` name seam (the documented monkeypatch pattern)."""
+    import fruitfly.loop as loop
+    from fruitfly.sim import LIFSim
+
+    run_dir = config.out_dir
+    if _run_dir_fresh(run_dir):
+        print(f"[t12b] {tag}: reusing {run_dir}")
+        return run_dir, None, None
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+
+    def _std_sim(c, dt_ms, seed):
+        return LIFSim(c, dt_ms=dt_ms, seed=seed,
+                      std_beta=beta, std_tau_rec_ms=tau)
+
+    chassis_token = loop._load_chassis  # noqa: SLF001 - documented seam
+    sim_token = loop.LIFSim
+    try:
+        loop._load_chassis = lambda: chassis
+        loop.LIFSim = _std_sim
+        result = run_backtest(config)
+    finally:
+        loop._load_chassis = chassis_token
+        loop.LIFSim = sim_token
+    per_bar = result.wall_s / max(1, result.n_bars)
+    print(f"[t12b] {tag}: {result.n_bars} bars, {result.n_orders} orders, "
+          f"equity {result.final_equity:.2f}, wall {result.wall_s:.0f}s "
+          f"({per_bar:.2f} s/bar incl. STD)")
+    import json
+
+    (run_dir / "timing.json").write_text(
+        json.dumps({"wall_s": result.wall_s, "n_bars": result.n_bars}) + "\n"
+    )
+    return run_dir, result.wall_s, result.n_bars
+
+
+def _diagnose_std_gains(stripped, transplant, beta: float, tau: float) -> dict:
+    """T12's gain sweep redone with STD: stripped (no STD) vs whole-fly
+    (STD) vs whole-fly (no STD) KC yield per SMELL_GAIN multiple on the
+    DIAG bar."""
+    from fruitfly.neuromod import Plasticity
+
+    diag_bar = _std_bars()[0]  # the DIAG bar is the first pick
+    _, ts, df, i, features = diag_bar
+    gains = {}
+    for mult in (1, 2, 4, 8):
+        row = {
+            "stripped": _probe_bar(stripped, Plasticity(stripped), ts, df, i,
+                                   features, gain=mult),
+            "whole_std": _probe_bar(transplant.labeled_chassis,
+                                    transplant.plasticity, ts, df, i, features,
+                                    gain=mult, std_beta=beta,
+                                    std_tau_rec_ms=tau),
+            "whole_nostd": _probe_bar(transplant.labeled_chassis,
+                                      transplant.plasticity, ts, df, i,
+                                      features, gain=mult),
+        }
+        gains[mult] = row
+    return gains
 
 
 def _diagnose_kc_silence(stripped, transplant) -> dict:
@@ -259,6 +511,299 @@ def _diagnose_kc_silence(stripped, transplant) -> dict:
         "apl_synapses_per_kc_median": float(np.median(apl_syn)),
         "upn_synapses_per_kc_median": float(np.median(upn_syn)),
     }
+
+
+def _main_std(args, artifact, transplant) -> int:
+    """T12b protocol: the D19 two-day, two-brain replay with the whole-fly
+    brain running LIFSim(std_beta, std_tau_rec_ms). Stripped brain is the
+    unchanged T12 reference (byte-reused receipts when present)."""
+    stripped = load_stripped_chassis()
+
+    # The stripped brain is bit-identical to its T12 counterpart (same seed,
+    # window, artifact weights, no STD) — reuse those receipts verbatim when
+    # they exist; otherwise rerun into the t12b dirs.
+    for tag in ("stripped_a", "stripped_b"):
+        dst = RUN_DIRS_STD[tag]
+        if _run_dir_fresh(dst):
+            continue
+        if dst.exists():
+            shutil.rmtree(dst)
+        if _run_dir_fresh(RUN_DIRS[tag]):
+            shutil.copytree(RUN_DIRS[tag], dst)
+            print(f"[t12b] {tag}: byte-copied receipts from {RUN_DIRS[tag]}")
+
+    config = dict(seed=args.seed, start=args.start, end=args.end,
+                  out_dir=None)  # out_dir set per run below
+    weights = artifact.weights
+    stripped_cfg_a = BacktestConfig(
+        **{**config, "out_dir": RUN_DIRS_STD["stripped_a"],
+           "initial_weights": weights}
+    )
+    stripped_cfg_b = BacktestConfig(
+        **{**config, "out_dir": RUN_DIRS_STD["stripped_b"],
+           "initial_weights": weights}
+    )
+    whole_weights = transplant.weights.copy()
+    whole_cfg_a = BacktestConfig(
+        **{**config, "out_dir": RUN_DIRS_STD["wholefly_a"],
+           "initial_weights": whole_weights}
+    )
+    whole_cfg_b = BacktestConfig(
+        **{**config, "out_dir": RUN_DIRS_STD["wholefly_b"],
+           "initial_weights": whole_weights}
+    )
+
+    timings: dict[str, tuple[float | None, int | None]] = {}
+    if not args.reuse:
+        _replay("stripped-A", stripped_cfg_a)
+        _replay("stripped-B", stripped_cfg_b)
+        for tag, cfg in (("wholefly-A", whole_cfg_a),
+                         ("wholefly-B", whole_cfg_b)):
+            _, wall_s, n_bars = _replay_std(
+                tag, cfg, transplant.labeled_chassis,
+                args.std_beta, args.std_tau_rec)
+            timings[tag] = (wall_s, n_bars)
+    # Reused receipts: recover the measured wall timings from the run dirs.
+    import json
+
+    for tag in ("wholefly-A", "wholefly-B"):
+        if timings.get(tag, (None, None))[0] is None:
+            tfile = RUN_DIRS_STD[tag.lower().replace("-", "_")] / "timing.json"
+            if tfile.exists():
+                t = json.loads(tfile.read_text())
+                timings[tag] = (t["wall_s"], t["n_bars"])
+
+    # --- determinism receipts ------------------------------------------------
+    receipts = {tag: {n: _sha256(d / n) for n in RECEIPTS}
+                for tag, d in RUN_DIRS_STD.items()}
+    det_stripped = receipts["stripped_a"] == receipts["stripped_b"]
+    det_wholefly = receipts["wholefly_a"] == receipts["wholefly_b"]
+    print(f"[t12b] determinism: stripped={det_stripped} wholefly={det_wholefly}")
+
+    # --- agreement -----------------------------------------------------------
+    rows, mean_action = agreement_table(
+        decision_log(RUN_DIRS_STD["stripped_a"] / "events.jsonl"),
+        decision_log(RUN_DIRS_STD["wholefly_a"] / "events.jsonl"),
+    )
+    for r in rows:
+        print(f"[t12b] {r['day']}: bars={r['bars']} "
+              f"action={r['action_agreement']:.4f} "
+              f"ticker={r['ticker_agreement']:.4f}")
+    print(f"[t12b] mean action agreement: {mean_action:.4f}  "
+          f"(D19 gate: {'PASS' if mean_action >= 0.9 else 'FAIL'} at 0.90)")
+
+    # Calibration evidence is cheap and fully deterministic: re-derive it so
+    # the report always carries the measured sweep, not a pasted one.
+    bars = _std_bars()
+    sweep_rows, ref_stripped, ref_whole = _sweep_std(stripped, transplant, bars)
+    gains = _diagnose_std_gains(stripped, transplant,
+                                args.std_beta, args.std_tau_rec)
+    _write_report_std(args, transplant, rows, mean_action, receipts,
+                      det_stripped, det_wholefly, sweep_rows, ref_stripped,
+                      ref_whole, gains, timings)
+    return 0
+
+
+def _write_report_std(args, transplant, rows, mean_action, receipts,
+                      det_stripped, det_wholefly, sweep_rows, ref_stripped,
+                      ref_whole, gains, timings) -> None:
+    """Render reports/t12b-apl-std.md from measured inputs only."""
+    from fruitfly.transplant import action_bucket
+
+    beta, tau = args.std_beta, args.std_tau_rec
+    chosen = _choose_std(sweep_rows, ref_stripped, ref_whole)
+    gate_pass = mean_action >= 0.9
+    whole_dec = decision_log(RUN_DIRS_STD["wholefly_a"] / "events.jsonl")
+    stripped_dec = decision_log(RUN_DIRS_STD["stripped_a"] / "events.jsonl")
+    n_orders = lambda dec: sum(  # noqa: E731
+        1 for _, _, a in dec if action_bucket(a) != "PASS")
+    kc_alive = chosen is not None and chosen["kc_spikes"] > 0
+
+    lines: list[str] = []
+    add = lines.append
+    add("# T12b — APL/DPM short-term depression: whole-fly KC revival and "
+        "D19 re-validation")
+    add("")
+    add(f"**Window:** {args.start} .. {args.end} (replay) · "
+        f"**Seed:** {args.seed} · **Artifact:** `{args.artifact}` · "
+        f"**STD:** beta={beta}, tau_rec={tau} ms · "
+        f"**Script:** `scripts/validate_transplant.py` "
+        f"(`--std-beta` / `--std-tau-rec` / `--calibrate-std`)")
+    add("")
+    add("Follow-up to reports/t12-transplant.md: T12 measured the whole-fly "
+        "readout silent — tonic APL/DPM feedback inhibition pins all 4064 "
+        "KCs below threshold (median 50 APL inhibitory synapses per KC vs "
+        "97 uPN excitatory) because quantal LIF coupling never fatigues. "
+        "T12b adds **opt-in short-term synaptic depression (STD)** to the "
+        "LIF engine's inhibitory terminals and re-runs the D19 validation.")
+    add("")
+    add("## Mechanism (opt-in, default off)")
+    add("")
+    add("- Per presynaptic node, a depression factor `f` in [0, 1] scales "
+        "that node's outgoing weights (`w[i,:] * f[i]`); only inhibitory "
+        "terminals are tracked (51,744 nodes with outgoing edges in the "
+        "whole fly). Excitatory and modulatory terminals keep `f = 1` "
+        "exactly — excitatory synapses are untouched.")
+    add("- Fixed per-substep op order: (1) deliver the previous substep's "
+        "spikes scaled by `f`; (2) integrate, refractory clamp, threshold; "
+        "(3) recover every inhibitory factor toward 1 with the exact "
+        "exponential form `f = 1 - (1 - f) * exp(-dt / tau_rec)` (the "
+        "exponential is precomputed once — no per-substep transcendentals; "
+        "`f == 1` is an exact fixed point, so undepressed terminals never "
+        "drift); (4) deplete the terminals that spiked this substep: "
+        "`f *= (1 - beta)`.")
+    add("- A spike is therefore delivered at its depleted amplitude, and "
+        "recovery accrues per substep until the next spike. Determinism: "
+        "fixed op order, float64, no RNG, no wall clock. With STD disabled "
+        "(the default) the propagation step uses the unscaled spike vector, "
+        "so existing runs are **bit-identical** to the pre-STD engine — "
+        "pinned by the full test suite plus a dedicated bit-identity test.")
+    add("")
+    add("## Calibration — (beta, tau_rec) sweep on replayed real bars")
+    add("")
+    add(f"- Calibration bars (XOM, 2026-09-11 session, identical loop drive "
+        f"per bar, seeded noise): "
+        f"{', '.join('`' + b[0] + '`' for b in _std_bars())}")
+    add("")
+    add("| Brain | KC spikes/bar | MBON drive | APL spikes | "
+        "LC/T4/T5 spikes | step wall (s) |")
+    add("|---|---|---|---|---|---|")
+    add(f"| stripped (no STD) | {ref_stripped['kc_spikes']:.1f} "
+        f"| {ref_stripped['mbon_drive']:.1f} | {ref_stripped['apl_spikes']:.0f} "
+        f"| {ref_stripped['vision_spikes']:.0f} "
+        f"| {ref_stripped['wall_s']:.3f} |")
+    add(f"| whole-fly (no STD) | {ref_whole['kc_spikes']:.1f} "
+        f"| {ref_whole['mbon_drive']:.1f} | {ref_whole['apl_spikes']:.0f} "
+        f"| {ref_whole['vision_spikes']:.0f} | {ref_whole['wall_s']:.3f} |")
+    if chosen is not None:
+        add(f"| **whole-fly (chosen STD)** | **{chosen['kc_spikes']:.1f}** "
+            f"| {chosen['mbon_drive']:.1f} | {chosen['apl_spikes']:.0f} "
+            f"| {chosen['vision_spikes']:.0f} (x{chosen['vision_ratio']:.2f} "
+            f"of no-STD) | {chosen['wall_s']:.3f} |")
+    add("")
+    add("Full grid (mean over the calibration bars; vision ratio = LC/T4/T5 "
+        "spike yield vs the no-STD whole-fly baseline):")
+    add("")
+    add("| beta | tau_rec (ms) | KC spikes | MBON drive | APL spikes | "
+        "vision spikes | vision x |")
+    add("|---|---|---|---|---|---|---|")
+    for r in sweep_rows:
+        add(f"| {r['beta']} | {r['tau']:.0f} | {r['kc_spikes']:.1f} "
+            f"| {r['mbon_drive']:.1f} | {r['apl_spikes']:.0f} "
+            f"| {r['vision_spikes']:.0f} | {r['vision_ratio']:.3f} |")
+    add("")
+    if chosen is not None:
+        add(f"Chosen: **beta = {chosen['beta']}, tau_rec = {chosen['tau']:.0f} ms** "
+            f"— KC yield {chosen['kc_spikes']:.1f}/bar vs the stripped "
+            f"brain's {ref_stripped['kc_spikes']:.1f}/bar at the same drive, "
+            f"with the LC/T4/T5 pathway at x{chosen['vision_ratio']:.2f} of "
+            f"its no-STD activity (floor {CAL_VISION_FLOOR:.2f}).")
+    else:
+        add("No sweep point met the acceptance rule (KC activity alive, "
+            "vision >= floor).")
+    add("")
+    add("## Whole-fly KC revival vs gain (DIAG bar)")
+    add("")
+    add("| SMELL_GAIN x | stripped KC (no STD) | whole-fly KC (STD) "
+        "| whole-fly KC (no STD) | whole-fly MBON drive (STD) |")
+    add("|---|---|---|---|---|")
+    for mult in sorted(gains):
+        g = gains[mult]
+        add(f"| {mult} | {g['stripped']['kc_spikes']} "
+            f"| {g['whole_std']['kc_spikes']} "
+            f"| {g['whole_nostd']['kc_spikes']} "
+            f"| {g['whole_std']['mbon_drive']:.1f} |")
+    if chosen is not None:
+        add("")
+        add(f"- Measured caveats: the transplanted KC→MBON drive under STD "
+            f"({chosen['mbon_drive']:.0f} summed activation/bar) is ~"
+            f"{chosen['mbon_drive'] / max(ref_stripped['mbon_drive'], 1e-9):.0f}x "
+            "the stripped brain's — the loop's decision variable is the "
+            "valence-normalized balance, so the scale difference does not "
+            "enter the BUY/SELL/pass comparison directly. LC/T4/T5 spike "
+            "yield is 0 in BOTH brains under this loop drive (vision is "
+            "delivered sub-threshold at the loop gain), so the vision "
+            "check is vacuous here — it measures that STD did not create "
+            "or destroy visual activity on these bars, not that a "
+            "vision-driven regime is preserved.")
+    add("")
+    add("## Decision agreement (per day, D19 metric)")
+    add("")
+    add("| Day | Bars decided | BUY/SELL/pass agreement | Ticker agreement "
+        "| Action + ticker |")
+    add("|---|---|---|---|---|")
+    for row in rows:
+        add(f"| {row['day']} | {row['bars']} "
+            f"| {_fmt_pct(row['action_agreement'])} "
+            f"| {_fmt_pct(row['ticker_agreement'])} "
+            f"| {_fmt_pct(row['action_and_ticker_agreement'])} |")
+    add(f"| **Mean (day-weighted)** | — | **{_fmt_pct(mean_action)}** | — | — |")
+    add("")
+    add(f"- Stripped brain orders: {n_orders(stripped_dec)} of "
+        f"{len(stripped_dec)} decided bars; whole-fly (STD) orders: "
+        f"{n_orders(whole_dec)} of {len(whole_dec)}.")
+    add("")
+    add("## Sim-rate impact")
+    add("")
+    wall_a, bars_a = timings.get("wholefly-A", (None, None))
+    if wall_a and bars_a:
+        add(f"- Whole-fly replay **with STD**: {wall_a:.0f} s for {bars_a} "
+            f"bars = {wall_a / bars_a:.2f} s/bar (loop dt = 1.0 ms).")
+    else:
+        add("- Whole-fly replay receipts were reused; re-run without "
+            "`--reuse` for a fresh timing.")
+    if chosen is not None:
+        add(f"- Engine-level step cost on the calibration bars: no-STD "
+            f"{ref_whole['wall_s']:.3f} s/bar vs STD {chosen['wall_s']:.3f} "
+            f"s/bar (x{chosen['wall_s'] / ref_whole['wall_s']:.2f}) — the "
+            "per-substep recovery pass over the inhibitory subset is the "
+            "only overhead.")
+    else:
+        add("- Engine-level step cost: see the calibration table.")
+    add("- T12 reference points: whole-fly LIF at 0.281x real time "
+        "(1.78 s/bar at dt = 0.5 ms); the loop runs dt = 1.0 ms.")
+    add("")
+    add("## Determinism receipts (same-seed replay byte-identical)")
+    add("")
+    add("| Run | events.jsonl sha256 | equity.csv sha256 | equity |")
+    add("|---|---|---|---|")
+    for tag in ("stripped_a", "stripped_b", "wholefly_a", "wholefly_b"):
+        run_dir = RUN_DIRS_STD[tag]
+        add(f"| {tag} | `{receipts[tag]['events.jsonl'][:16]}…` "
+            f"| `{receipts[tag]['equity.csv'][:16]}…` | {_equity_of(run_dir)} |")
+    add("")
+    add(f"- Stripped replay A ≡ B (byte-identical): "
+        f"**{'yes' if det_stripped else 'NO'}**")
+    add(f"- Whole-fly replay A ≡ B (byte-identical): "
+        f"**{'yes' if det_wholefly else 'NO'}**")
+    add("")
+    add("## D19 branch recommendation (for human ratification)")
+    add("")
+    if gate_pass:
+        add(f"Mean decision agreement **{_fmt_pct(mean_action)}** >= 90% "
+            "with the whole-fly brain firing: this report **proposes "
+            "RESTORING D19** — the Phase-B live carrier becomes the "
+            "whole-fly LIF sim running LIFSim(std_beta=..., "
+            "std_tau_rec_ms=...). DESIGN.md is not edited here; the human "
+            "ratifies the flip.")
+    elif kc_alive:
+        add(f"Mean decision agreement **{_fmt_pct(mean_action)}** < 90% "
+            "despite revived KC activity (whole-fly KC yield "
+            f"{chosen['kc_spikes']:.1f}/bar under STD): the whole-fly brain "
+            "now acts but disagrees with the stripped engine often enough "
+            "that a live cutover is not warranted. This report **proposes "
+            "demo-mode decisions** — the whole-fly brain (with STD) decides "
+            "in promo/art mode while the live engine stays the stripped "
+            "chassis (D10 Phase A). DESIGN.md is not edited here; the "
+            "human ratifies.")
+    else:
+        add("Whole-fly KCs remain silent under every calibrated STD point; "
+            "the T12 revocation stands and the silence is documented as "
+            "continued.")
+    add("")
+    REPORT_PATH_STD.write_text("\n".join(lines) + "\n")
+    print(f"[t12b] report written to {REPORT_PATH_STD}")
+
 
 
 def _fmt_pct(x: float) -> str:

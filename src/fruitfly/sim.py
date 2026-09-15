@@ -26,6 +26,26 @@ photoreceptors, unresolved) integrate current and cross threshold like any
 other node — their spikes are counted — but their outgoing weights are zero,
 so they never propagate into the LIF layer; the neuromodulation layer (T5)
 reads their activity instead.
+
+Short-term synaptic depression (STD, opt-in): with ``std_beta`` and
+``std_tau_rec_ms`` given, every inhibitory presynaptic terminal carries a
+depression factor ``f[i]`` in ``[0, 1]`` that scales its outgoing weights
+(``w[i, :] * f[i]``); excitatory and modulatory terminals keep ``f = 1``.
+The substep op order is fixed:
+
+1. deliver the previous substep's spikes scaled by the current ``f``;
+2. integrate, refractory-clamp, threshold;
+3. recover every inhibitory factor toward 1 with the exact exponential form
+   ``f = 1 - (1 - f) * exp(-dt / tau_rec)`` (``exp`` precomputed once — no
+   per-substep transcendentals, and ``f == 1`` is an exact fixed point, so
+   undepressed terminals never drift);
+4. deplete the terminals that spiked this substep: ``f *= (1 - beta)``.
+
+A spike is therefore delivered at its depleted amplitude and recovery
+accrues per substep until the next spike. Fully deterministic: fixed op
+order, float64, no wall clock, no RNG. With STD disabled (the default) the
+propagation step uses ``prev`` itself, so the arithmetic is bit-identical
+to the pre-STD engine.
 """
 
 from __future__ import annotations
@@ -70,11 +90,38 @@ class LIFSim:
         Stored for API compatibility with the loop layer. The engine is fully
         deterministic — no RNG is consulted anywhere — so any seed yields
         byte-identical dynamics.
+    std_beta:
+        Opt-in short-term-depression depletion fraction per presynaptic
+        spike at inhibitory terminals, in ``(0, 1)``. Default ``None`` =
+        STD off (bit-identical to the pre-STD engine).
+    std_tau_rec_ms:
+        STD recovery time constant (ms); required together with
+        ``std_beta``. Between spikes an inhibitory terminal's depression
+        factor recovers toward 1 as ``f = 1 - (1 - f) * exp(-dt/tau_rec)``
+        per substep (exact exponential form, see module docstring).
     """
 
-    def __init__(self, chassis: Chassis, dt_ms: float = 0.5, seed: int = 0):
+    def __init__(
+        self,
+        chassis: Chassis,
+        dt_ms: float = 0.5,
+        seed: int = 0,
+        std_beta: float | None = None,
+        std_tau_rec_ms: float | None = None,
+    ):
         if dt_ms <= 0:
             raise ValueError("dt_ms must be positive")
+        if (std_beta is None) != (std_tau_rec_ms is None):
+            raise ValueError("std_beta and std_tau_rec_ms must be given together")
+        if std_beta is not None and not 0.0 < std_beta < 1.0:
+            raise ValueError("std_beta must be in (0, 1)")
+        if std_tau_rec_ms is not None and std_tau_rec_ms <= 0:
+            raise ValueError("std_tau_rec_ms must be positive")
+        self.std_beta = None if std_beta is None else float(std_beta)
+        self.std_tau_rec_ms = (
+            None if std_tau_rec_ms is None else float(std_tau_rec_ms)
+        )
+        self._std = std_beta is not None
         self.chassis = chassis
         self.dt_ms = float(dt_ms)
         self.seed = int(seed)
@@ -106,6 +153,27 @@ class LIFSim:
         self._syn = np.zeros(n, dtype=np.float64)
         self._zero_input = np.zeros(n, dtype=np.float64)
 
+
+        # --- opt-in short-term depression (STD) state -----------------------
+        # Depression factor per node in [0, 1]; 1.0 exactly for every
+        # non-inhibitory node, so scaling the spike vector by it is a no-op
+        # outside inhibitory terminals. Only inhibitory nodes with outgoing
+        # weights are tracked (empty rows can never deliver a PSP).
+        self._f = np.ones(n, dtype=np.float64)
+        if self._std:
+            self._std_inh = np.flatnonzero(
+                (sign < 0) & (np.diff(w.indptr) > 0)
+            ).astype(np.intp)
+            # Exact exponential recovery per substep, precomputed once:
+            # f = 1 - (1 - f) * exp(-dt / tau_rec). f == 1 is an exact fixed
+            # point of this form, so undepressed terminals never drift.
+            self._std_recover = float(np.exp(-self.dt_ms / self.std_tau_rec_ms))
+            self._std_deplete = 1.0 - self.std_beta
+            # Scaled spike vector buffer (std mode only), preallocated.
+            self._src = np.zeros(n, dtype=np.float64)
+
+        # Presynaptic inhibitory mask (sign < 0); STD depletion targets.
+        self._sign_neg = sign < 0
         self._spikes = np.zeros(n, dtype=np.int64)
 
     # ------------------------------------------------------------------
@@ -127,6 +195,8 @@ class LIFSim:
         self._prev.fill(0.0)
         self._spikes.fill(0)
 
+        if self._std:
+            self._f.fill(1.0)
     # ------------------------------------------------------------------
     def step(
         self, input_current: np.ndarray | None, duration_ms: float
@@ -193,20 +263,37 @@ class LIFSim:
         w_data = self._w_data
         v_reset = V_RESET
         v_th = V_TH
+        std = self._std
+        sign_neg = self._sign_neg
+        if std:
+            f = self._f
+            src = self._src
+            std_inh = self._std_inh
+            std_recover = self._std_recover
+            std_deplete = self._std_deplete
 
         for _ in range(steps):
-            # 1. Propagate last substep's spikes through the signed CSR.
+            # 1. Propagate last substep's spikes through the signed CSR. In
+            #    STD mode the spike vector is pre-scaled by the per-terminal
+            #    depression factor (row i of W scaled by f[i] == prev[i] *
+            #    f[i] times row i); with STD off the vector is ``prev``
+            #    itself, bit-identical to the pre-STD engine.
             spiked_prev = np.flatnonzero(prev)
             if spiked_prev.size:
+                if std:
+                    np.multiply(prev, f, out=src)
+                    spike_vec = src
+                else:
+                    spike_vec = prev
                 if spiked_prev.size <= _ROW_LOOP_MAX:
                     # Exact row-slice accumulation, ascending row order.
                     syn.fill(0.0)
                     for i in spiked_prev:
                         s = w_indptr[i]
                         e = w_indptr[i + 1]
-                        syn[w_indices[s:e]] += w_data[s:e] * prev[i]
+                        syn[w_indices[s:e]] += w_data[s:e] * spike_vec[i]
                 else:
-                    syn[:] = prev @ self._w
+                    syn[:] = spike_vec @ self._w
             else:
                 syn.fill(0.0)
 
@@ -231,13 +318,24 @@ class LIFSim:
                 step_counts[spiked_idx] += 1
                 spikes[spiked_idx] += 1
 
-            # 5. Bookkeeping for the next substep.
+            # 5. STD bookkeeping (fixed op order, see module docstring):
+            #    advance every inhibitory terminal's recovery to the end of
+            #    this substep, then deplete the terminals that spiked here.
+            #    A spike is therefore delivered at its depleted amplitude
+            #    and recovery accrues per substep until the next spike.
+            if std:
+                fi = f[std_inh]
+                f[std_inh] = 1.0 - (1.0 - fi) * std_recover
+                if spiked_idx.size:
+                    inh_spiked = spiked_idx[sign_neg[spiked_idx]]
+                    if inh_spiked.size:
+                        f[inh_spiked] *= std_deplete
+
+            # 6. Bookkeeping for the next substep.
             prev.fill(0.0)
             prev[spiked_idx] = 1.0
             if idx_refr.size:
                 refr[idx_refr] -= 1
-
-
 
 __all__ = [
     "LIFSim",
