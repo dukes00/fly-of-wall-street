@@ -237,10 +237,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
     from fruitfly.loop import BacktestConfig, run_backtest
     from fruitfly.train import decision_map, load_larval_weights
 
-    if args.chassis == "whole":
-        chassis = load_whole_fly()
-    else:
-        chassis = load_stripped_chassis()
+    chassis = (
+        load_whole_fly() if args.chassis == "whole" else load_stripped_chassis()
+    )
     lw = load_larval_weights(args.weights, chassis)
     meta = {k: lw.meta.get(k, "?") for k in ("seed", "start", "end")}
     print(f"probe day {args.day}, seed {args.seed}")

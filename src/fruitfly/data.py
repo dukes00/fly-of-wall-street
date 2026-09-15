@@ -15,6 +15,7 @@ pandas-market-calendars for 2024-2027. Hardcoded for determinism; no network.
 from __future__ import annotations
 
 import argparse
+import os
 import time as _time
 from datetime import UTC, date, time
 from pathlib import Path
@@ -31,7 +32,7 @@ BASKET: list[str] = [
     "CVX", "ABBV", "SPY", "^GSPC",
 ]
 
-CACHE_DIR = Path("data/market")
+CACHE_DIR = Path(os.environ.get("FRUITFLY_MARKET_DIR", "data/market"))
 REPORT_PATH = Path("reports/t6-data.md")
 
 _COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
