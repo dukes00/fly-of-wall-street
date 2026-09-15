@@ -19,9 +19,9 @@ Best-case outcome (the joke's jackpot): the fly beats the average active fund ma
 - Connectome: complete male Drosophila CNS (Berg et al., Cell 2026 — Google/Janelia). 166,691 neurons, ~125M synapses, brain + optic lobes + ventral nerve cord, fruitless/doublesex annotated.
 - Simulation recipe: leaky integrate-and-fire, weights from synapse counts, excitatory/inhibitory from predicted transmitter (Shiu et al., Nature 2024 style).
 - Two run modes:
-  - **Stripped chassis** — retina + optic lobe + olfactory pathway + mushroom body + descending readout. Trains fast. The working engine.
-  - **Whole fly** — all 166,691 neurons, all the time. The art piece / promo mode.
-- Run mode (settled, D10): **phased**. Phase A — stripped-chassis training harness (fast iteration, surgical plasticity, locatable failures). Phase B — transplant learned KC→MBON weights into the whole-fly sim for the live adult stage. Transplant fidelity (D19, revocable): direct KC→MBON weight copy, then behavioral validation — replay held-out market days through both brains, require ≥90% decision agreement; fine-tune only if below.
+  - **Stripped chassis** — retina + optic lobe + olfactory pathway + mushroom body + descending readout. Trains fast. The dev/test lane.
+  - **Whole fly** — all 166,691 neurons, all the time. The live engine (D22) and the art piece.
+- Run mode (revised, D22): **whole-fly is the live brain**. The whole-fly LIF engine gained opt-in short-term synaptic depression on inhibitory terminals (calibrated β=0.1, τ_rec=500 ms) — required because tonic APL/DPM feedback inhibition otherwise pins KCs below threshold in a fatique-free quantal model. With STD, the whole fly fires KCs at stripped-brain yield and trades (~1.26 s/bar ≈ 8 min per 390-bar day on M1 — live-speed feasible). The larval stage now trains **directly on the whole-fly chassis**; the stripped chassis remains the fast dev/test lane. The transplant path (D10 Phase B, D19) is **dropped**: measured transplant agreement was 72.82% < 90%, and direct training makes transfer — and the agreement gate — moot. Evaluation duty passes to held-out replay on extended IEX 1-min history plus live paper receipts. Stripped-vs-whole head-to-head on the in-sample replay window: whole-fly +$874 vs stripped +$488 (2 days, statistically inconclusive).
 
 ## 3. Senses
 
@@ -138,6 +138,7 @@ Not a content product (settled, D11). The artifact is the run itself plus its re
 | D19 | 2026-09-11 | Transplant: direct KC→MBON weight copy + behavioral validation (≥90% decision agreement on held-out days). Duke deferred; my call, revocable |
 | D20 | 2026-09-11 | Target hardware: MacBook Pro M1 (Apple Silicon); no Raspberry Pi target |
 | D21 | 2026-09-11 | Dashboard stack: FastAPI + uvicorn + SSE push; single static page, vanilla JS + canvas; no build step, no JS libraries; read-only file interface to run receipts |
+| D22 | 2026-09-14 | **Supersedes D19 (and D10 Phase B).** Transplant dropped; whole-fly (166,700 neurons, male CNS v1.0) is the live brain, trained directly via larval-stage plasticity. Enabler: opt-in short-term synaptic depression on inhibitory terminals in the LIF engine (β=0.1, τ_rec=500 ms), without which APL/DPM feedback inhibition silences all KCs in a fatigue-free quantal model. Stripped chassis (27,115 neurons) becomes the fast dev/test lane. Signed off by Duke in session. Evidence: reports/t12-transplant.md, reports/t12b-apl-std.md |
 
 ## 15. Parking lot (non-blocking)
 
@@ -149,6 +150,7 @@ Empty as of v0.3 — P2–P9 all settled (D12–D19). New open questions land he
 - **v0.2 (2026-09-11):** D10 settled P1 — phased chassis (stripped training → whole-fly weight transplant). D11: de-contented — no streaming; output = receipts, daily statement, post-mortem (§12 rewritten, P8 recast as reporting tech). P9 added (transplant fidelity). Remaining parking-lot items presented with defaults.
 - **v0.3 (2026-09-11):** All parking-lot items settled: US equities (D12), N=10 (D13), death at −50% equity (D14), taste in v1 (D15), 1-min bars (D16), single fly (D17), live local dashboard over PDF (D18), transplant = copy + validate ≥90% (D19, revocable, my call on Duke's defer). Ideation complete. Next phase: implementation planning.
 - **v0.4 (2026-09-11):** D20: target hardware — MacBook Pro M1; Raspberry Pi clause removed (§13). D21: dashboard stack — FastAPI + SSE + vanilla canvas, file-interface, no build step (§13). Implementation plan written: plan/TASKS.md v0.2 (15 tasks, larval harness first).
+- **v0.5 (2026-09-14):** D22 — whole-fly is the live brain, trained directly; transplant (D19) dropped; STD added to the LIF engine (§2 rewritten). Implementation status: all 15 tasks of plan/TASKS.md v0.1 complete (M1–M4), plus the APL/STD revision. Extended IEX 1-min history acquisition for held-out evaluation in progress.
 
 ---
 
