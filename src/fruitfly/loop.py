@@ -995,8 +995,6 @@ def run_backtest(config: BacktestConfig) -> RunResult:
                 chassis, plasticity, sim, upn_rows, channels, list(frames),
                 config.ms_per_bar,
             )
-            emit({"type": "hatch", "hatch_equity": round(hatch_equity, 6)})
-            equity = cash
         # 8. Bar receipt.
         equity_writer.writerow(
             [ts.isoformat(), f"{equity:.2f}", f"{cash:.2f}", len(positions)]

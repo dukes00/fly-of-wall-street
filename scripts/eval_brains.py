@@ -187,6 +187,12 @@ def evaluate_arm(
 
     brain = load_whole_fly() if chassis == "whole" else load_stripped_chassis()
     lw = load_larval_weights(artifact, brain)
+    train_end = str(lw.meta.get("end", ""))
+    if days[0] <= train_end:
+        raise ValueError(
+            f"held-out day {days[0]} is not after the artifact's training "
+            f"window end {train_end}; refusing to evaluate on training days"
+        )
 
     runs_root = results_dir / "runs" / chassis
     per_day: list[dict] = []
