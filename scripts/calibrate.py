@@ -211,9 +211,12 @@ def cmd_train(args: argparse.Namespace) -> int:
     from fruitfly.loop import BacktestConfig
     from fruitfly.train import train_larval
 
-    config = BacktestConfig(seed=args.seed, start=args.start, end=args.end,
-                            chassis=args.chassis, std_beta=args.std_beta,
-                            std_tau_rec_ms=args.std_tau_rec_ms)
+    config = BacktestConfig(
+        seed=args.seed, start=args.start, end=args.end,
+        chassis=args.chassis, std_beta=args.std_beta,
+        std_tau_rec_ms=args.std_tau_rec_ms,
+        **({"out_dir": Path(args.run_dir)} if args.run_dir else {}),
+    )
     print(f"T9 larval training: seed {args.seed} {args.start}..{args.end} -> {args.out}")
     train = train_larval(config, out_path=Path(args.out))
     r = train.run
@@ -345,6 +348,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--end", required=True)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--out", default="data/fly-larval-weights.npz")
+    p.add_argument("--run-dir", default=None,
+                   help="Override the run receipts directory (default: "
+                        "data/runs/backtest_{seed}_{start}_{end}).")
     p.set_defaults(func=cmd_train)
     _add_chassis_args(p)
 
