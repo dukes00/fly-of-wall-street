@@ -3,6 +3,7 @@
 **Status:** RATIFIED by Duke 2026-09-16 (A1–A9 as DESIGN v0.7; §10 checklist closed; `MISS_WEIGHT=0.25`; objective = active trader choosing on information — A vs B decided empirically in Phase 0). Corrective pass after design review: the six review blockers are pinned in place (avoid-side credit, single-credit last-credit-wins rule, T-1 exit-scoring cost/default, overlap-robust G-A.1 statistics, artifact meta contract, turnover guard G-A.3).
 **Grounding:** all file:line refs are against `src/fruitfly/` at HEAD. Runtime claims trace to measured numbers: stripped ≈ 2–3 min/trading-day, whole ≈ 8.3 min/day, whole-fly eval ≈ 40 min/day (M1 Pro, 16 GB). Data: Alpaca IEX 1m free (D8), 2024+2025 fetched (~40 symbol-years), IEX depth verified to 2024+; ≥2016 unverified.
 
+**PHASE-0 HEAD-TO-HEAD VERDICT (2026-09-16): Option B (advantage gating) wins** — `reports/h2h-avsb-phase0.md`. Stripped lane, 10 days, seed 7: B leads on the ratified objective (positive sign-stable entry signal +0.023/+1.02 with subsample agreement, trades/day 1.77× reference inside the G-A.3 band, win/loss 1.80, paired +0.87%/day vs reference t=+2.15); A's entry signal is ~zero with subsample sign disagreement. G-A.1 fails for both at this power (effective n ≈ 400 — expected); Phase A proceeds with B + the §6 Phase-A grid, G-A.1 re-checked per cell, capture preservation tracked as the §9.2 sentinel.
 ---
 
 ## EXECUTIVE SUMMARY

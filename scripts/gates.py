@@ -49,18 +49,21 @@ def _market_index(market_dir: Path) -> dict[str, pd.DataFrame]:
     return idx
 
 
-def _bar_pos(df: pd.DataFrame, ts_ns: int) -> int:
+def _bar_pos(df: pd.DataFrame, ts) -> int:
     """Index of the last bar whose timestamp is <= ts (the encounter bar)."""
-    pos = int(np.searchsorted(df["_ts"].values, ts_ns, side="right") - 1)
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    pos = int(df["_ts"].searchsorted(ts, side="right") - 1)
     return max(pos, 0)
 
 
-def forward_return(market: dict[str, pd.DataFrame], ticker: str, ts_ns: int,
+def forward_return(market: dict[str, pd.DataFrame], ticker: str, ts,
                    horizon: int) -> float | None:
     df = market.get(ticker)
     if df is None:
         return None
-    pos = _bar_pos(df, ts_ns)
+    pos = _bar_pos(df, ts)
     if pos + horizon >= len(df):
         return None
     c0 = float(df["close"].iloc[pos])
@@ -109,22 +112,17 @@ def hac_tstat(x: np.ndarray, y: np.ndarray, lag: int) -> tuple[float, float]:
 def collect_samples(events: list[dict], market: dict[str, pd.DataFrame],
                     horizon: int) -> list[dict]:
     """Signal-bearing encounters: balance_used at decision + fwd return."""
-    balances: dict[tuple[int, str], float] = {}
-    for ev in events:
-        if ev.get("type") == "decision" and ev.get("balance_used") is not None:
-            balances[(ev["ts"], ev["ticker"])] = float(ev["balance_used"])
     samples = []
     for ev in events:
         if ev.get("type") != "encounter":
             continue
-        key = (ev["ts"], ev["ticker"])
-        if key not in balances:
+        if ev.get("balance_used") is None:
             continue
         r = forward_return(market, ev["ticker"], ev["ts"], horizon)
         if r is None:
             continue
         samples.append({"ts": ev["ts"], "ticker": ev["ticker"],
-                        "balance": balances[key], "fwd": r})
+                        "balance": float(ev["balance_used"]), "fwd": r})
     return samples
 
 
@@ -203,9 +201,9 @@ def behavior_gate(trades: list[dict]) -> dict:
 # ----------------------------------------------------------------- G-A.3
 
 def turnover_metrics(events: list[dict], trades: list[dict]) -> dict:
-    ts_list = [ev["ts"] for ev in events] or [0]
+    ts_list = [pd.Timestamp(ev["ts"]) for ev in events if "ts" in ev]
     # count calendar days spanned for a fair trades/day
-    days = len({ts // 86_400_000_000_000 for ts in ts_list}) or 1
+    days = len({ts.date() for ts in ts_list}) or 1
     n_trades = len(trades)
     n_encounters = sum(1 for ev in events if ev.get("type") == "encounter")
     n_buys = sum(1 for ev in events if ev.get("type") == "order" and ev.get("side") == "buy")
