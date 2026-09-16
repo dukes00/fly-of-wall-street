@@ -139,10 +139,11 @@ def patched(monkeypatch):
         monkeypatch.setattr(mod, "_load_chassis", lambda: chassis)
         monkeypatch.setattr(mod, "load_bars", lambda symbols, start=None, end=None: bars)
         monkeypatch.setattr(mod, "BASKET", ["AAA", "BBB"])
+        monkeypatch.setattr(mod, "_load_whole_chassis", lambda: chassis)
     return adult
 
 def _config(out_dir: Path, **overrides) -> AdultConfig:
-    defaults = dict(ms_per_bar=20.0, dt_ms=0.5, seed=7,
+    defaults = dict(ms_per_bar=20.0, dt_ms=0.5, seed=7, chassis="stripped",
                     start="2026-08-18", end="2026-08-19")
     return AdultConfig(run_dir=out_dir, **{**defaults, **overrides})
 
@@ -675,13 +676,14 @@ class TestChassisPassThrough:
         assert echo["std_beta"] == 0.1
         assert echo["std_tau_rec_ms"] == 500.0
 
-    def test_default_is_stripped_without_std(self):
-        cfg = _config(Path("data/adult/unused"))
-        assert cfg.chassis == "stripped"
-        assert cfg.std_beta is None and cfg.std_tau_rec_ms is None
+    def test_default_is_whole_with_calibrated_std(self):
+        cfg = AdultConfig(run_dir=Path("data/adult/unused"), ms_per_bar=20.0,
+                          dt_ms=0.5, seed=7, start="2026-08-18", end="2026-08-19")
+        assert cfg.chassis == "whole"
+        assert cfg.std_beta == 0.1 and cfg.std_tau_rec_ms == 500.0
         bt = cfg.backtest_config()
-        assert bt.chassis == "stripped"
-        assert bt.std_beta is None and bt.std_tau_rec_ms is None
+        assert bt.chassis == "whole"
+        assert bt.std_beta == 0.1 and bt.std_tau_rec_ms == 500.0
 
     def test_unknown_chassis_rejected(self):
         with pytest.raises(ValueError, match="chassis must be"):

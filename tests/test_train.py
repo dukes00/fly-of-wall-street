@@ -82,7 +82,7 @@ def patched(monkeypatch, tmp_path):
 
 
 def _config(out_dir: Path, start="2026-08-18", end="2026-08-19", **overrides):
-    defaults = dict(ms_per_bar=20.0, dt_ms=0.5)
+    defaults = dict(ms_per_bar=20.0, dt_ms=0.5, chassis="stripped")
     from fruitfly.loop import BacktestConfig
 
     return BacktestConfig(seed=7, out_dir=out_dir, start=start, end=end,
@@ -327,13 +327,14 @@ class TestChassisArtifact:
         lw = load_larval_weights(tmp_path / "whole.npz")
         assert lw.meta["chassis"] == "whole"
 
-    def test_stripped_default_meta_is_backward_visible(self, patched, tmp_path):
-        train = train_larval(
-            _config(tmp_path / "run"), out_path=tmp_path / "stripped.npz"
-        )
-        assert train.meta["chassis"] == "stripped"
-        assert train.meta["std_beta"] == "None"
-        assert train.meta["std_tau_rec_ms"] == "None"
+    def test_default_meta_is_whole(self, patched, monkeypatch, tmp_path):
+        loop = patched
+        monkeypatch.setattr(loop, "_load_whole_chassis", make_chassis)
+        train = train_larval(_config(tmp_path / "run", chassis="whole"),
+                             out_path=tmp_path / "whole.npz")
+        assert train.meta["chassis"] == "whole"
+        assert train.meta["std_beta"] == "0.1"
+        assert train.meta["std_tau_rec_ms"] == "500.0"
 
     def test_chassis_kind_guard_rejects_mismatch(self, patched, tmp_path):
         train_larval(_config(tmp_path / "run"), out_path=tmp_path / "larval.npz")

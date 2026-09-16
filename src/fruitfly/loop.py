@@ -267,10 +267,11 @@ class BacktestConfig:
     #: shape-(n_kc, n_mbon) float64 (e.g. ``load_larval_weights`` output).
     #: ``None`` (default) keeps the structural baseline — behavior unchanged.
     initial_weights: np.ndarray | None = None
-    #: Brain chassis: ``"stripped"`` (default, the fast dev/test lane) or
-    #: ``"whole"`` (the full proofread fly, labeled for the loop's
-    #: population-keyed readouts — see ``_load_whole_chassis``).
-    chassis: str = "stripped"
+    #: Brain chassis: ``"whole"`` (default since 2026-09-16, D22 shootout
+    #: verdict — the full proofread fly, labeled for the loop's
+    #: population-keyed readouts, see ``_load_whole_chassis``) or
+    #: ``"stripped"`` (the fast dev/test lane).
+    chassis: str = "whole"
     #: Opt-in short-term synaptic depression (T12b). ``None`` = off (the
     #: engine stays bit-identical to the pre-STD one). On ``chassis="whole"``
     #: an unset parameter defaults to the calibrated T12b values
@@ -534,7 +535,7 @@ def _load_whole_chassis() -> Chassis:
 
 
 def _resolve_chassis(config: BacktestConfig) -> Chassis:
-    """Chassis per ``config.chassis``: stripped (default) or whole fly."""
+    """Chassis per ``config.chassis``: whole fly (default, D22) or stripped."""
     if config.chassis == "whole":
         return _load_whole_chassis()
     return _load_chassis()

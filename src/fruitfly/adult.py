@@ -178,7 +178,8 @@ class AdultConfig:
     dt_ms: float = DT_MS
     #: Brain chassis + opt-in STD (mirror of ``loop.BacktestConfig``; the
     #: whole-fly chassis defaults to the calibrated T12b STD parameters).
-    chassis: str = "stripped"
+    #: Default ``"whole"`` since 2026-09-16 (D22 shootout verdict).
+    chassis: str = "whole"
     std_beta: float | None = None
     std_tau_rec_ms: float | None = None
 
@@ -1455,7 +1456,7 @@ def _load_whole_chassis():
 
 
 def _resolve_chassis(config: AdultConfig):
-    """Chassis per ``config.chassis``: stripped (default) or whole fly."""
+    """Chassis per ``config.chassis``: whole fly (default, D22) or stripped."""
     if config.chassis == "whole":
         return _load_whole_chassis()
     return _load_chassis()
@@ -1484,15 +1485,20 @@ def _register() -> None:
         p.add_argument("--start", required=True, help="e.g. 2026-08-17")
         p.add_argument("--end", required=True, help="e.g. 2026-09-14")
         p.add_argument("--mode", choices=("replay", "live-paper"), default="replay")
-        p.add_argument("--run-dir", default=None)
         p.add_argument(
-            "--chassis", choices=("stripped", "whole"), default="stripped",
-            help="Brain chassis; 'whole' implies the calibrated T12b STD.",
+            "--chassis", choices=("stripped", "whole"), default="whole",
+            help="Brain chassis (default 'whole', D22 shootout verdict); "
+                 "'whole' implies the calibrated T12b STD.",
         )
         p.add_argument("--std-beta", type=float, default=None)
         p.add_argument("--std-tau-rec-ms", type=float, default=None)
         p.add_argument("--persist-every", type=int, default=1)
-        p.add_argument("--larval-weights", default=None, help="T9 .npz artifact path")
+        p.add_argument(
+            "--larval-weights",
+            default="data/fly-whole-weights.npz",
+            help="T9 .npz artifact path (default: the trained whole-fly "
+                 "brain, D22 shootout verdict).",
+        )
         p.set_defaults(func=_cmd_adult)
 
     register_command("adult", builder)

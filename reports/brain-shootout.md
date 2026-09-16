@@ -11,7 +11,7 @@ the extended IEX cache, against SPX buy-hold over the same days
 | arm | chassis | artifact | md5 | trained window | meta |
 |---|---|---|---|---|---|
 | stripped | stripped | `data/fly-stripped-hist-weights.npz` | 99137f6f9bf2… | 2026-03-02..2026-06-30 | seed=7 bars=32611 deaths=0 std=(None,None) |
-| whole | whole | data/fly-whole-weights.npz | — | 2026-03-02..2026-06-30 (whole-fly training in flight) | **PENDING** |
+| whole | whole | `data/fly-whole-weights.npz` | ee7304003964… | 2026-03-02..2026-06-30 | seed=7 bars=32611 deaths=0 std=(None,None) |
 
 ## Held-out comparison
 
@@ -21,18 +21,17 @@ seed 7); trades = orders, deaths = fly deaths. TOTAL row:
 arms aggregate mean daily return %, worst-day drawdown %, summed
 trades/deaths; SPX shows the compounded window return % and the
 drawdown % across the held-out days.
-Missing whole-fly arm = PENDING.
 
 | day | SPX ret% | SPX dd% | stripped ret% | stripped dd% | stripped trades | stripped deaths | whole ret% | whole dd% | whole trades | whole deaths |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2026-08-28 | -0.249 | — | -0.237 | 1.215 | 154 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-08-31 | -0.332 | — | 0.088 | 0.433 | 187 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-01 | -0.711 | — | -0.755 | 1.208 | 179 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-02 | 0.460 | — | -0.006 | 0.882 | 177 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-03 | 1.058 | — | 0.564 | 0.670 | 166 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-04 | -0.376 | — | 0.310 | 0.361 | 173 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-08 | -0.584 | — | -0.528 | 0.814 | 158 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-09 | -0.484 | — | -0.176 | 0.441 | 195 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-10 | -0.585 | — | -0.729 | 0.897 | 162 | 0 | PENDING | PENDING | PENDING | PENDING |
-| 2026-09-11 | 0.860 | — | -0.525 | 0.593 | 190 | 0 | PENDING | PENDING | PENDING | PENDING |
-| TOTAL | -0.957 | 2.014 | -0.199 | 1.215 | 1741 | 0 | PENDING | PENDING | PENDING | PENDING |
+| 2026-08-28 | -0.249 | — | -0.237 | 1.215 | 154 | 0 | -0.807 | 1.291 | 184 | 0 |
+| 2026-08-31 | -0.332 | — | 0.088 | 0.433 | 187 | 0 | 0.043 | 0.520 | 202 | 0 |
+| 2026-09-01 | -0.711 | — | -0.755 | 1.208 | 179 | 0 | 0.015 | 0.261 | 163 | 0 |
+| 2026-09-02 | 0.460 | — | -0.006 | 0.882 | 177 | 0 | -0.293 | 0.521 | 196 | 0 |
+| 2026-09-03 | 1.058 | — | 0.564 | 0.670 | 166 | 0 | 0.962 | 0.807 | 230 | 0 |
+| 2026-09-04 | -0.376 | — | 0.310 | 0.361 | 173 | 0 | 0.410 | 0.483 | 184 | 0 |
+| 2026-09-08 | -0.584 | — | -0.528 | 0.814 | 158 | 0 | -0.216 | 0.602 | 172 | 0 |
+| 2026-09-09 | -0.484 | — | -0.176 | 0.441 | 195 | 0 | 0.069 | 0.396 | 181 | 0 |
+| 2026-09-10 | -0.585 | — | -0.729 | 0.897 | 162 | 0 | -0.593 | 0.795 | 187 | 0 |
+| 2026-09-11 | 0.860 | — | -0.525 | 0.593 | 190 | 0 | -0.563 | 0.661 | 180 | 0 |
+| TOTAL | -0.957 | 2.014 | -0.199 | 1.215 | 1741 | 0 | -0.097 | 1.291 | 1879 | 0 |

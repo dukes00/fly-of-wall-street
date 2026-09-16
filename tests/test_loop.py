@@ -151,6 +151,7 @@ def patched_lc(monkeypatch, tmp_path):
     import fruitfly.loop as loop
 
     monkeypatch.setattr(loop, "_load_chassis", lambda: make_chassis(lc=True))
+    monkeypatch.setattr(loop, "_load_whole_chassis", lambda: make_chassis(lc=True))
     monkeypatch.setattr(
         loop, "load_bars", lambda symbols, start=None, end=None: make_looming_bars()
     )
@@ -163,6 +164,7 @@ def patched(monkeypatch, tmp_path):
     """Wire the loop's seams to the synthetic chassis + bars."""
     import fruitfly.loop as loop
 
+    monkeypatch.setattr(loop, "_load_whole_chassis", lambda: chassis)
     chassis = make_chassis()
     bars = make_bars()
     monkeypatch.setattr(loop, "_load_chassis", lambda: chassis)
@@ -483,17 +485,18 @@ class TestFillModel:
 
 
 class TestChassisConfig:
-    """``BacktestConfig`` chassis/STD surface (defaults must not move)."""
+    """``BacktestConfig`` chassis/STD surface (defaults: D22 v0.6 verdict)."""
 
-    def test_default_is_stripped_without_std(self):
+    def test_default_is_whole_with_calibrated_std(self):
+        # D22 shootout verdict (2026-09-16): the whole fly is the live brain;
+        # whole implies the calibrated T12b STD defaults.
         cfg = BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18")
-        assert cfg.chassis == "stripped"
-        assert cfg.std_beta is None
-        assert cfg.std_tau_rec_ms is None
+        assert cfg.chassis == "whole"
+        assert cfg.std_beta == 0.1
+        assert cfg.std_tau_rec_ms == 500.0
 
-    def test_fill_mode_validation(self):
-        assert BacktestConfig(
-            seed=1, start="2026-08-18", end="2026-08-18"
+    def test_fill_mode_default_and_validation(self):
+        assert BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18"
         ).fill_mode == "pessimistic_next_bar"
         with pytest.raises(ValueError, match="fill_mode"):
             BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
@@ -520,7 +523,7 @@ class TestChassisConfig:
     def test_partial_std_on_stripped_rejected(self):
         with pytest.raises(ValueError, match="together"):
             BacktestConfig(seed=1, start="2026-08-18", end="2026-08-18",
-                           std_beta=0.1)
+                           chassis="stripped", std_beta=0.1)
 
     def test_std_ranges_validated(self):
         with pytest.raises(ValueError, match="std_beta"):
@@ -534,7 +537,7 @@ class TestChassisConfig:
 class TestChassisSimConstruction:
     """The loop builds the engine the config asks for (real code path)."""
 
-    def test_default_run_builds_std_off_sim(self, patched, monkeypatch, tmp_path):
+    def test_default_run_builds_calibrated_std_sim(self, patched, monkeypatch, tmp_path):
         import fruitfly.loop as loop
 
         seen: dict = {}
@@ -546,9 +549,9 @@ class TestChassisSimConstruction:
 
         monkeypatch.setattr(loop, "LIFSim", spy)
         run_backtest(_config(7, tmp_path / "run"))
-        # STD off by default: the engine stays bit-identical to the pre-STD one.
-        assert seen["std_beta"] is None
-        assert seen["std_tau_rec_ms"] is None
+        # Whole default: the calibrated STD beta/tau ship switched on.
+        assert seen["std_beta"] == 0.1
+        assert seen["std_tau_rec_ms"] == 500.0
 
     def test_whole_config_routes_whole_seam_and_calibrated_std(
         self, patched, monkeypatch, tmp_path
