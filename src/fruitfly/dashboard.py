@@ -503,9 +503,12 @@ def build_state(run_dir: Path, now: float | None = None) -> dict:
         thr["avoid"] = round(min(avoid), 9)
     state["neural"]["thresholds"] = {"inferred": True, **thr} if thr else None
 
-    # Glance strip: latest event timestamp vs wall clock. A run dir with
-    # neither receipt file reports ``waiting``; receipts without any
-    # parseable event timestamp report ``quiet`` (nothing contradicts flow).
+    # Glance strip liveness: the events.jsonl wall-clock mtime is the only
+    # honest "is the writer alive" signal — sim-time age vs wall clock is
+    # meaningless for fast lanes (a stripped run emits ~156 sim-min per wall
+    # min, so a live run looks "stalled" on sim age). ``last_event_age_s``
+    # stays sim-time (informative for slow whole-fly runs); the status dot
+    # uses mtime. A run dir with neither receipt file reports ``waiting``.
     if not (run_dir / _EQUITY_CSV).exists() and not (run_dir / _EVENTS_JSONL).exists():
         state["status"] = "waiting"
     else:
@@ -518,9 +521,11 @@ def build_state(run_dir: Path, now: float | None = None) -> dict:
             state["events_per_min"] = round(
                 sum(1 for e in epochs if e >= newest - window) / RATE_WINDOW_MIN, 4
             )
+            events_path = run_dir / _EVENTS_JSONL
+            mtime_age = max(0.0, now - events_path.stat().st_mtime)
             state["status"] = (
-                "live" if age < LIVE_GRACE_S
-                else "quiet" if age < QUIET_GRACE_S
+                "live" if mtime_age < LIVE_GRACE_S
+                else "quiet" if mtime_age < QUIET_GRACE_S
                 else "stalled"
             )
         else:

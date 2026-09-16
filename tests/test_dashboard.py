@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -311,15 +312,22 @@ def test_all_routes_200(run_dir: Path) -> None:
 
 
 def test_glance_strip_computed(run_dir: Path) -> None:
-    """Status dot, last-event age, events/min and latest bar vs a pinned clock."""
+    """Status dot follows events.jsonl wall-clock mtime; sim-age stays honest."""
     now = datetime(2026, 8, 19, 13, 0, 2, tzinfo=UTC).timestamp()
     s = build_state(run_dir, now=now)
-    assert s["status"] == "live"  # latest event (hologram) is 1s old
-    assert s["last_event_age_s"] == 1.0
+    assert s["status"] == "live"  # writer emitted moments ago (fresh mtime)
+    assert s["last_event_age_s"] == 1.0  # sim-time age is independent
     assert s["events_per_min"] == 0.2  # death + hologram in the last 10 sim-min
     assert s["latest_bar_ts"] == "2026-08-18T13:32:00+00:00"
-    assert build_state(run_dir, now=now + 400)["status"] == "quiet"  # amber
-    assert build_state(run_dir, now=now + 10**6)["status"] == "stalled"  # red
+
+    events = run_dir / "events.jsonl"
+    os.utime(events, (now - 400.0, now - 400.0))  # writer stopped 400s ago
+    assert build_state(run_dir, now=now)["status"] == "quiet"  # amber
+    os.utime(events, (now - 10**6, now - 10**6))  # writer gone for ages
+    assert build_state(run_dir, now=now)["status"] == "stalled"  # red
+    # A fast lane keeps emitting: fresh mtime overrides a huge sim age.
+    os.utime(events, (now + 10**6 - 1.0, now + 10**6 - 1.0))
+    assert build_state(run_dir, now=now + 10**6)["status"] == "live"
 
 
 def test_glance_without_events(run_dir: Path) -> None:
