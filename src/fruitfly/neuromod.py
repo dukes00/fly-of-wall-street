@@ -201,6 +201,24 @@ class Plasticity:
         y = self._slice(post_spikes, self.mbon_index, "post_spikes")
         return (x * self._habituation)[:, None] * y[None, :] * self.support
 
+    def compact_driver(
+        self, pre_spikes: np.ndarray, post_spikes: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Rank-1 factorization of the :meth:`eligibility_driver` increment.
+
+        Returns ``(kc_activity, post)`` — the habituation-gated KC activity
+        and the MBON activity — such that
+        ``kc_activity[:, None] * post[None, :] * self.support`` is bitwise
+        the driver increment above. Storing the pair (n_kc + n_mbon floats,
+        ~33 KB on the real chassis) instead of the full (n_kc, n_mbon) trace
+        (~3.1 MB) is the compact per-encounter snapshot format consumed by
+        :meth:`observe_trade_compact` (TRAINING2-SPEC §2, shared plumbing).
+        Pure: mutates nothing.
+        """
+        x = self.kc_activity(pre_spikes)
+        y = self._slice(post_spikes, self.mbon_index, "post_spikes")
+        return x * self._habituation, y
+
     # ------------------------------------------------------------------ gate
     def reward_drive(self, state: NeuromodState) -> float:
         """PAM drive: reward scaled up by hunger (drawdown → risk appetite)."""
@@ -293,7 +311,82 @@ class Plasticity:
             self._weights += delta
             np.clip(self._weights, 0.0, None, out=self._weights)  # synapses ≥ 0
 
+    def observe_trade_compact(
+        self,
+        compact: tuple[np.ndarray, np.ndarray, np.ndarray | None],
+        reward: float,
+        punishment: float,
+        *,
+        hunger: float = 0.0,
+        arousal: float = 0.0,
+    ) -> None:
+        """Per-credit update from a compact encounter snapshot.
+
+        Same three-factor update as :meth:`observe_trade` — gate × snapshot
+        × MBON valence against the structural support, live eligibility
+        trace and habituation untouched — but the (n_kc, n_mbon) snapshot is
+        rebuilt from ``compact = (kc_activity, post, support)`` instead of a
+        full trace copy: ``kc_activity`` is the habituation-gated KC
+        activity and ``post`` the MBON activity captured at the opening
+        encounter (``compact_driver`` returns exactly this pair), and
+        ``support`` is the mask applied to the outer product. ``support``
+        of ``None`` (the default inside a compact) uses the structural
+        ``self.support`` — the only choice that is bitwise identical to
+        :meth:`observe_trade` on the same underlying traces. An explicit
+        mask must be ``(n_kc, n_mbon)`` or per-MBON ``(n_mbon,)`` bool; a
+        per-MBON mask folds the column masking only, so with one the update
+        equals ``observe_trade`` only where the structural support is
+        column-uniform. Either way the structural support masks the final
+        delta — plasticity never invents synapses the connectome lacks.
+
+        ``reward`` / ``punishment`` (plus optional ``hunger`` / ``arousal``)
+        build the same :class:`NeuromodState` gate as ``observe_trade``
+        (``d = reward_drive − punishment_gain · punishment``); they go
+        through the same non-negative/finite validation.
+
+        Deterministic: float64, no RNG, fixed op order.
+        """
+        kc_activity, post, support = compact
+        x = np.asarray(kc_activity, dtype=np.float64)
+        y = np.asarray(post, dtype=np.float64)
+        if x.shape != (self.kc_index.size,):
+            raise ValueError(
+                "compact kc_activity must have one entry per KC row "
+                f"(shape ({self.kc_index.size},)), got {x.shape}"
+            )
+        if y.shape != (self.mbon_index.size,):
+            raise ValueError(
+                "compact post must have one entry per MBON column "
+                f"(shape ({self.mbon_index.size},)), got {y.shape}"
+            )
+        if support is None:
+            mask = self.support
+        else:
+            mask = np.asarray(support, dtype=bool)
+            if mask.shape == self.support.shape:
+                pass
+            elif mask.shape == (self.mbon_index.size,):
+                mask = mask[None, :]
+            else:
+                raise ValueError(
+                    "compact support must be None, (n_kc, n_mbon) "
+                    f"{self.support.shape}, or per-MBON "
+                    f"({self.mbon_index.size},); got {mask.shape}"
+                )
+        state = NeuromodState(
+            reward=reward, punishment=punishment, hunger=hunger, arousal=arousal
+        )
+        d = self._gate(state)
+        if abs(d) > 0.0:
+            snapshot = x[:, None] * y[None, :] * mask
+            # Three-factor update: gate × snapshot × MBON valence.
+            delta = (self.learning_rate * d) * (snapshot * self.mbon_valence[None, :])
+            delta *= self.support
+            self._weights += delta
+            np.clip(self._weights, 0.0, None, out=self._weights)  # synapses ≥ 0
+
     # ------------------------------------------------------------------ sleep
+
     def sleep(self) -> None:
         """Consolidation + regime forgetting (DESIGN §4, D7).
 

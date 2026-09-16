@@ -32,6 +32,56 @@ BASKET: list[str] = [
     "CVX", "ABBV", "SPY", "^GSPC",
 ]
 
+#: Frozen never-seen eval basket (TRAINING2 §3.4): symbols that must appear
+#: in NO training run, ever. ``resolve_basket`` treats a missing file as a
+#: no-op guard.
+NEVERSEEN_BASKET_PATH = Path("baskets/eval20-neverseen.txt")
+
+
+def parse_basket_file(path: str | Path) -> list[str]:
+    """Parse a basket file (TRAINING2 §3): one symbol per line; ``#`` starts
+    a comment (full-line or trailing); blank lines are skipped; duplicates
+    keep their first occurrence and the file order. Pure and deterministic.
+    """
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for raw in Path(path).read_text().splitlines():
+        symbol = raw.split("#", 1)[0].strip()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+    return symbols
+
+
+def neverseen_basket(path: str | Path | None = None) -> list[str]:
+    """The frozen never-seen eval basket; ``[]`` when the file is absent."""
+    p = Path(path) if path is not None else NEVERSEEN_BASKET_PATH
+    if not p.exists():
+        return []
+    return parse_basket_file(p)
+
+
+def resolve_basket(symbols: list[str] | None = None) -> list[str]:
+    """The effective run basket: ``symbols`` (a parsed ``--basket-file``)
+    or the module ``BASKET`` default.
+
+    TRAINING2 §3.4 guard: raises ``ValueError`` listing the offenders when
+    the basket intersects the frozen never-seen eval basket — a training
+    run must never touch a held-out symbol. A missing never-seen file is a
+    no-op (the guard arms when the basket is committed).
+    """
+    basket = list(BASKET) if symbols is None else list(symbols)
+    forbidden = set(neverseen_basket())
+    offenders = sorted({s for s in basket if s in forbidden})
+    if offenders:
+        raise ValueError(
+            "basket intersects the frozen never-seen eval basket "
+            f"({NEVERSEEN_BASKET_PATH}): {offenders}"
+        )
+    return basket
+
+
 CACHE_DIR = Path(os.environ.get("FRUITFLY_MARKET_DIR", "data/market"))
 REPORT_PATH = Path("reports/t6-data.md")
 

@@ -382,7 +382,8 @@ class FlyState:
             "hatch_equity": self.hatch_equity,
             "equity": self.equity,
             "positions": {
-                t: {"shares": p.shares, "avg_cost": p.avg_cost}
+                t: {"shares": p.shares, "avg_cost": p.avg_cost,
+                    "high_water": p.high_water}
                 for t, p in self.positions.items()
             },
             "last_close": self.last_close,
@@ -450,7 +451,8 @@ class FlyState:
         state.hatch_equity = payload["hatch_equity"]
         state.equity = payload["equity"]
         state.positions = {
-            t: _Position(shares=int(p["shares"]), avg_cost=float(p["avg_cost"]))
+            t: _Position(shares=int(p["shares"]), avg_cost=float(p["avg_cost"]),
+                         high_water=float(p.get("high_water", p["avg_cost"])))
             for t, p in payload["positions"].items()
         }
         state.last_close = {t: float(v) for t, v in payload["last_close"].items()}
@@ -1021,7 +1023,9 @@ class AdultRun:
         st.cash -= shares * price * (1.0 + self._cfg.fees)
         pos = st.positions.get(o.ticker)
         if pos is None:
-            st.positions[o.ticker] = _Position(shares=shares, avg_cost=price)
+            st.positions[o.ticker] = _Position(
+                shares=shares, avg_cost=price, high_water=price
+            )
         else:
             total = pos.shares + shares
             pos.avg_cost = (pos.avg_cost * pos.shares + shares * price) / total

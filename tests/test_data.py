@@ -11,6 +11,9 @@ from fruitfly.data import (
     _conform,
     is_regular_session,
     load_bars,
+    neverseen_basket,
+    parse_basket_file,
+    resolve_basket,
 )
 
 NS = 1_000_000_000
@@ -149,3 +152,49 @@ def test_chunk_window_splits_into_contiguous_seven_day_windows() -> None:
     assert _chunk_window(start, start + pd.Timedelta(days=6)) == [
         (start, start + pd.Timedelta(days=6))
     ]
+
+
+# ---------------------------------------------------------------------------
+# TRAINING2 Phase 0 §3: basket files + the never-seen eval guard
+# ---------------------------------------------------------------------------
+
+
+class TestBasketFiles:
+    def test_parse_basket_file_round_trip(self, tmp_path):
+        f = tmp_path / "train40.txt"
+        f.write_text(
+            "# TRAINING2 train basket (committed artifact)\n"
+            "AAPL\n"
+            "\n"
+            "   MSFT   # trailing comment\n"
+            "AAPL\n"
+            "NVDA\n"
+        )
+        # One symbol per line, '#' comments (full-line and trailing), blank
+        # lines skipped, duplicates keep their first occurrence and order.
+        assert parse_basket_file(f) == ["AAPL", "MSFT", "NVDA"]
+
+    def test_resolve_basket_defaults_and_missing_guard_is_noop(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "fruitfly.data.NEVERSEEN_BASKET_PATH", tmp_path / "absent.txt"
+        )
+        assert neverseen_basket() == []
+        assert resolve_basket(["AAA", "BBB"]) == ["AAA", "BBB"]
+        # None -> the module BASKET, returned as a fresh list.
+        resolved = resolve_basket()
+        assert resolved == list(BASKET)
+        assert resolved is not BASKET
+
+    def test_resolve_basket_raises_on_neverseen_intersection(
+        self, tmp_path, monkeypatch
+    ):
+        p = tmp_path / "eval20-neverseen.txt"
+        p.write_text("# frozen eval basket — never train on these\nZZZZ\nQQQQ\n")
+        monkeypatch.setattr("fruitfly.data.NEVERSEEN_BASKET_PATH", p)
+        with pytest.raises(ValueError) as ei:
+            resolve_basket(["AAPL", "ZZZZ", "QQQQ"])
+        # The offenders are listed; clean symbols are not offenders.
+        assert "ZZZZ" in str(ei.value) and "QQQQ" in str(ei.value)
+        assert "AAPL" not in str(ei.value)

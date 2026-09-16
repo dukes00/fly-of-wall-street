@@ -209,12 +209,13 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 def cmd_train(args: argparse.Namespace) -> int:
     from fruitfly.loop import BacktestConfig
-    from fruitfly.train import train_larval
+    from fruitfly.train import knob_kwargs, train_larval
 
     config = BacktestConfig(
         seed=args.seed, start=args.start, end=args.end,
         chassis=args.chassis, std_beta=args.std_beta,
         std_tau_rec_ms=args.std_tau_rec_ms,
+        **knob_kwargs(args),
         **({"out_dir": Path(args.run_dir)} if args.run_dir else {}),
     )
     print(f"T9 larval training: seed {args.seed} {args.start}..{args.end} -> {args.out}")
@@ -352,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="Override the run receipts directory (default: "
                         "data/runs/backtest_{seed}_{start}_{end}).")
     p.set_defaults(func=cmd_train)
+    from fruitfly.train import add_knob_args
+
+    add_knob_args(p)
     _add_chassis_args(p)
 
     p = sub.add_parser("probe", help="Fresh vs larval-weights decision comparison.")

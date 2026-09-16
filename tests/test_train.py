@@ -18,6 +18,8 @@ from test_loop import make_chassis
 
 from fruitfly.neuromod import Plasticity
 from fruitfly.train import (
+    META_KNOBS,
+    decode_baselines,
     load_larval_weights,
     save_larval_weights,
     train_larval,
@@ -365,3 +367,168 @@ class TestChassisArtifact:
         )
         lw2 = load_larval_weights(tmp_path / "legacy.npz", make_chassis())
         assert "chassis" not in lw2.meta
+
+
+# ---------------------------------------------------------------------------
+# TRAINING2 Phase 0 (A9): artifact meta contract
+# ---------------------------------------------------------------------------
+
+
+def _load_meta(path: Path) -> dict[str, str]:
+    return load_larval_weights(path).meta
+
+
+def _stub_baselines(monkeypatch, baselines: dict) -> None:
+    """Make the loop's RunResult carry Option-B baselines (advantage mode)."""
+    import dataclasses
+
+    import fruitfly.loop as loop
+
+    original = loop.run_backtest
+
+    def wrapper(config):
+        return dataclasses.replace(original(config), baselines=baselines)
+
+    monkeypatch.setattr(loop, "run_backtest", wrapper)
+
+
+class TestMetaContract:
+    def test_meta_roundtrips_every_knob_and_basket(self, patched, tmp_path):
+        from dataclasses import fields
+
+        from fruitfly.loop import BacktestConfig
+
+        overrides = dict(
+            entry_credit="forecast", horizon_bars=15, r_scale=0.004,
+            a_scale=0.002, baseline_alpha=0.1, miss_weight=0.3,
+            avoid_correct_weight=0.4, trade_credit_mode="mix",
+            mix_weight=0.7, daily_observe="off", id_scale=0.0,
+            reward_gain=1.5, punishment_gain=0.8,
+            basket=["AAA", "BBB"])
+        # §4 gate gains are not plumbed through BacktestConfig yet; the
+        # meta writer skips unassertable knobs, so test only carried knobs.
+        carried = {f.name for f in fields(BacktestConfig)}
+        overrides = {k: v for k, v in overrides.items() if k in carried}
+        config = _config(tmp_path / "run", **overrides)
+        train = train_larval(config, out_path=tmp_path / "a.npz")
+        meta = _load_meta(train.artifact)
+        probe = BacktestConfig(seed=0, start="", end="")
+        for name in META_KNOBS:
+            if hasattr(probe, name):
+                assert meta[name] == str(getattr(config, name))
+        assert meta["entry_credit"] == "forecast"
+        assert meta["trade_credit_mode"] == "mix"
+        assert meta["mix_weight"] == "0.7"
+        assert meta["daily_observe"] == "off"
+        assert meta["horizon_bars"] == "15"
+        assert meta["r_scale"] == "0.004"
+        assert meta["id_scale"] == "0.0"
+        assert meta["basket"] == json.dumps(["AAA", "BBB"])
+        # Advantage-only field is absent in forecast mode.
+        assert "initial_baselines" not in meta
+
+    def test_meta_defaults_are_noop(self, patched, tmp_path):
+        """CLI/config defaults keep the legacy meta fields byte-identical."""
+        train = train_larval(_config(tmp_path / "run"),
+                             out_path=tmp_path / "a.npz")
+        meta = _load_meta(train.artifact)
+        legacy = {
+            "seed": "7",
+            "start": "2026-08-18",
+            "end": "2026-08-19",
+            "position_cap": "10",
+            "chassis": "stripped",
+        }
+        for key, value in legacy.items():
+            assert meta[key] == value
+        assert meta["entry_credit"] == "off"
+        assert meta["trade_credit_mode"] == "realized"
+        assert meta["daily_observe"] == "on"
+        assert meta["id_scale"] == "1.0"
+        # reward/punishment gains are §4 knobs; tolerate a config that does
+        # not carry them yet (the meta writer skips unassertable knobs).
+        for name in ("reward_gain", "punishment_gain"):
+            if name in meta:
+                assert meta[name] == "1.0"
+
+    def test_advantage_run_persists_initial_baselines(self, patched,
+                                                      monkeypatch, tmp_path):
+        _stub_baselines(monkeypatch, {(0, 1, 0): 0.012, (1, 0, 1): -0.003})
+        train = train_larval(
+            _config(tmp_path / "run", entry_credit="advantage"),
+            out_path=tmp_path / "b.npz",
+        )
+        meta = _load_meta(train.artifact)
+        assert json.loads(meta["initial_baselines"]) == {
+            "0|1|0": 0.012, "1|0|1": -0.003,
+        }
+        assert decode_baselines(meta["initial_baselines"]) == {
+            (0, 1, 0): 0.012, (1, 0, 1): -0.003,
+        }
+
+    def test_non_advantage_run_omits_baselines_even_when_present(
+            self, patched, monkeypatch, tmp_path):
+        _stub_baselines(monkeypatch, {(0, 0, 0): 0.01})
+        train = train_larval(
+            _config(tmp_path / "run", entry_credit="forecast"),
+            out_path=tmp_path / "c.npz",
+        )
+        assert "initial_baselines" not in _load_meta(train.artifact)
+
+    def test_loader_ignores_unknown_meta_keys(self, patched, tmp_path):
+        """The additive contract: a future writer's extra keys load fine."""
+        train = train_larval(_config(tmp_path / "run"),
+                             out_path=tmp_path / "a.npz")
+        lw = load_larval_weights(train.artifact)
+        save_larval_weights(
+            tmp_path / "future.npz", lw.weights, lw.fingerprint,
+            {**lw.meta, "future_knob": "whenever", "grudge_top_k": "32"},
+        )
+        lw2 = load_larval_weights(tmp_path / "future.npz", make_chassis())
+        assert lw2.meta["future_knob"] == "whenever"
+        assert lw2.meta["grudge_top_k"] == "32"
+
+    def test_train_cli_defaults_produce_noop_meta(self, patched, tmp_path):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "calibrate", Path(__file__).resolve().parents[1]
+            / "scripts" / "calibrate.py")
+        assert spec is not None and spec.loader is not None
+        calibrate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(calibrate)
+        out = tmp_path / "cli.npz"
+        calibrate.main([
+            "train", "--start", "2026-08-18", "--end", "2026-08-19",
+            "--chassis", "stripped", "--out", str(out),
+            "--run-dir", str(tmp_path / "run1"),
+        ])
+        meta = _load_meta(out)
+        assert meta["seed"] == "7"
+        assert meta["entry_credit"] == "off"
+        assert meta["trade_credit_mode"] == "realized"
+        assert meta["daily_observe"] == "on"
+        assert meta["id_scale"] == "1.0"
+        assert meta["basket"] == json.dumps(["AAA", "BBB"])
+
+    def test_train_cli_passes_knobs_through(self, patched, tmp_path):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "calibrate", Path(__file__).resolve().parents[1]
+            / "scripts" / "calibrate.py")
+        assert spec is not None and spec.loader is not None
+        calibrate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(calibrate)
+        out = tmp_path / "cli.npz"
+        calibrate.main([
+            "train", "--start", "2026-08-18", "--end", "2026-08-19",
+            "--out", str(out),
+            "--run-dir", str(tmp_path / "run2"),
+            "--entry-credit", "forecast", "--id-scale", "0.0",
+            "--daily-observe", "off",
+        ])
+        meta = _load_meta(out)
+        assert meta["entry_credit"] == "forecast"
+        assert meta["id_scale"] == "0.0"
+        assert meta["daily_observe"] == "off"

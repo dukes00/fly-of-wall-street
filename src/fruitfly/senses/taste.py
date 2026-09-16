@@ -13,6 +13,14 @@ spikes; their activity is read by the neuromodulation layer (T5) as the
 dopamine gate for KC->MBON plasticity. Taste current is therefore the circuit's
 way of *poking* the dopaminergic clusters, not of driving downstream LIF.
 
+**Dead channel today (TRAINING2-SPEC A5, §5.1):** PAM/PPL1 are sign-0 nodes —
+they integrate input and never propagate spikes (see neuromod.py:15-19) — and
+the backtest loop reads no PAM/PPL1 spike activity, so the taste currents this
+encoder drives into those rows are readout-inert: taste cannot influence any
+decision today. The D15 sweet/bitter -> PAM/PPL1 mapping is acknowledged as a
+documented dead channel pending a D15 revisit (exit forecasting is handled
+explicitly by the T-1 exit-forecast gate instead).
+
 Magnitude: ``gain * tanh(|pnl|)`` — exactly 0 at flat, strictly monotonic in
 |pnl|, saturating at extreme moves. Per-node gains carry a deterministic
 BLAKE2b-derived jitter in [0.8, 1.2] (ordering preserved: monotonic in |pnl|

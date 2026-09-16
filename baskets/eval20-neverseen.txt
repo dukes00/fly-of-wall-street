@@ -1,0 +1,29 @@
+# TRAINING2 never-seen eval basket (Phase 0, frozen 2026-09-16)
+# NEVER train on these — 20 names disjoint from every training set, ever.
+# Not in trained-21, not in burned alt-21, not in baskets/train40.txt.
+# IEX depth gate (spec 3.2, >=300/390 median bars/day, 2024-03 probe): PASS except
+# flagged Tier-B below (relaxation forced by pool size, see reports/iex-depth.md):
+#   flagged <300: GILD 296.5, BA 268, UPS 263.5, MMM 261
+# Provenance: SLB PFE MRK T VZ = pinned passers; GILD BA UPS MMM = pinned, flagged;
+# INTC MU PLTR CMCSA MO KHC SCHW MS C PSX NEE = wide-pool substitutes (all PASS).
+# Dropped pinned (all FAIL gate): CAT DE LMT UNP COP TGT LOW DUK GS BLK SBUX.
+SLB
+PFE
+MRK
+T
+VZ
+GILD
+BA
+UPS
+MMM
+INTC
+MU
+PLTR
+CMCSA
+MO
+KHC
+SCHW
+MS
+C
+PSX
+NEE

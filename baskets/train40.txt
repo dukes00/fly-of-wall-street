@@ -1,0 +1,53 @@
+# TRAINING2 train40 basket (Phase 0, frozen 2026-09-16)
+# 22 current BASKET names (src/fruitfly/data.py, incl. ^GSPC Yahoo daily proxy) + 18 additions.
+# IEX depth gate (spec 3.2, >=300/390 median bars/day, 2024-03 probe): PASS for all names
+# except flagged Tier-B below (relaxed, see reports/iex-depth.md):
+#   flagged <300: ADI 208, DOW 270.5, GE 286, USB 282.5, DVN 289.5
+# Provenance: FCX CSX pass pinned additions; DOW ADI pinned additions (flagged);
+# CRM AMD QCOM ORCL CSCO NKE KO WMT DIS BAC WFC = burned alt-21, training-only, all PASS;
+# GE USB DVN = wide-pool substitutes (all train reserves failed the gate).
+# Deviation from pinned lists forced: strict-300 non-burned pool = 18 names < 18+ needed.
+# Fetch range 2024-01-01..2025-12-31 in data/market/history/; never-seen eval basket
+# (baskets/eval20-neverseen.txt) is disjoint from this file.
+# --- current 22 ---
+AAPL
+MSFT
+GOOGL
+AMZN
+NVDA
+META
+TSLA
+BRK-B
+JPM
+V
+UNH
+XOM
+LLY
+JNJ
+PG
+MA
+HD
+AVGO
+CVX
+ABBV
+SPY
+^GSPC
+# --- additions (18) ---
+FCX
+CSX
+DOW
+ADI
+CRM
+AMD
+QCOM
+ORCL
+CSCO
+NKE
+KO
+WMT
+DIS
+BAC
+WFC
+GE
+USB
+DVN

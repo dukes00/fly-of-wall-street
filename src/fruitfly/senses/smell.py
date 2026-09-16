@@ -184,7 +184,9 @@ def upn_channels(chassis) -> tuple[np.ndarray, np.ndarray]:
     return upn_rows, channels
 
 
-def encode_smell(ticker: str, features: dict, chassis) -> np.ndarray:
+def encode_smell(
+    ticker: str, features: dict, chassis, id_scale: float = 1.0
+) -> np.ndarray:
     """Encode ticker identity x market state into 391 uPN currents.
 
     ``features`` maps (a subset of) ``FEATURES`` to floats — returns as a
@@ -193,6 +195,17 @@ def encode_smell(ticker: str, features: dict, chassis) -> np.ndarray:
     :func:`build_features`. A missing key takes its neutral value
     (``FEATURE_NEUTRAL``: 0.0 for returns/volatility/volume_delta/mom20/
     slope20, 50.0 for RSI) and leaves the identity signature untouched.
+
+    ``id_scale`` (TRAINING2-SPEC §3, DESIGN A2) is the identity-attenuation
+    knob: it scales the identity ``base[channels]`` term ONLY — the state
+    modulator is computed unchanged. Default 1.0 is byte-identical to the
+    incumbent output (``x * 1.0`` is exact in float64); ``id_scale=0.0``
+    zeroes the identity glomeruli, and since the state enters purely
+    multiplicatively on the identity, the whole output goes to zero. The
+    hatch sniff / daily anchor refresh reads the mean identity profile
+    directly (``_innate_balance`` bypasses ``encode_smell`` by design), so
+    scaling here alone does not attenuate the silent-anchor path.
+
     Returns float64, shape (n_uPN,) = (391,), aligned to uPN nodes in chassis
     order. Pure and deterministic.
     """
@@ -210,4 +223,4 @@ def encode_smell(ticker: str, features: dict, chassis) -> np.ndarray:
         for k, ch in enumerate(channels):
             w = stable_uniform(f"smell-mod:{f}:{int(ch)}", -_MOD_WEIGHT, _MOD_WEIGHT)
             modulator[k] *= 1.0 + w * s
-    return base[channels] * modulator
+    return base[channels] * float(id_scale) * modulator

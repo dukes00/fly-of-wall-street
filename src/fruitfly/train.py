@@ -26,6 +26,13 @@ member           content                                        dtype
 ``meta_*``       provenance strings (seed, window, params, …)   unicode
 ===============  =============================================  ==============
 
+Artifact meta contract (TRAINING2 A9, additive): ``train_larval`` records
+the credit-knob echo (``META_KNOBS``), the trained ``basket`` (JSON list of
+the loop's bound ``BASKET`` symbols), and — advantage mode only — the
+Option-B ``initial_baselines`` (JSON ``"sign|vol|dir"`` int triple -> float,
+for multi-run warm-starts). Existing loaders ignore unknown meta keys; a
+legacy artifact without the new keys still loads unchanged.
+
 Determinism: ``np.savez`` stamps zip members with the wall clock, so it is
 NOT byte-reproducible. ``save_larval_weights`` therefore writes the same
 .npz layout by hand — ``numpy.lib.format.write_array`` blobs stored with
@@ -39,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -51,16 +59,22 @@ from fruitfly.loop import BacktestConfig, RunResult
 __all__ = [
     "LARVAL_WEIGHTS_PATH",
     "TRAIN_SEED",
+    "META_KNOBS",
     "LarvalWeights",
     "TrainResult",
+    "add_knob_args",
     "chassis_fingerprint",
+    "decode_baselines",
+    "encode_baselines",
+    "knob_kwargs",
+    "meta_knobs",
     "save_larval_weights",
     "load_larval_weights",
     "train_larval",
     "decision_map",
 ]
 
-#: Default artifact path (relative to the repo root; gitignored via data/).
+
 LARVAL_WEIGHTS_PATH = Path("data/fly-larval-weights.npz")
 
 #: Default training seed (matches the T7 receipts so runs are comparable).
@@ -72,6 +86,141 @@ _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 #: match at load time (the fingerprint guard cannot distinguish two chassis
 #: built on identical graphs; the label can).
 _CHASSIS_KINDS = {"stripped": "stripped-chassis", "whole": "whole-fly"}
+
+
+# ---------------------------------------------------------------------------
+# TRAINING2 artifact meta contract (A9): credit knobs + basket + baselines
+# ---------------------------------------------------------------------------
+
+
+#: The TRAINING2 credit knobs ``train_larval`` records in the artifact meta
+#: and ``scripts/eval_brains.py`` asserts against the eval runtime config.
+#: Canonical order — both the meta writer and the report renderer emit in
+#: this order. Additive: existing artifact loaders ignore unknown meta keys.
+META_KNOBS: tuple[str, ...] = (
+    "entry_credit", "trade_credit_mode", "mix_weight", "daily_observe",
+    "horizon_bars", "r_scale", "a_scale", "baseline_alpha",
+    "miss_weight", "avoid_correct_weight",
+    "id_scale", "reward_gain", "punishment_gain",
+)
+
+#: CLI type of each pass-through knob (everything else is a string enum).
+KNOB_TYPES: dict[str, type] = {
+    "horizon_bars": int,
+    "id_scale": float,
+    "r_scale": float,
+    "a_scale": float,
+    "baseline_alpha": float,
+    "miss_weight": float,
+    "avoid_correct_weight": float,
+    "mix_weight": float,
+    "reward_gain": float,
+    "punishment_gain": float,
+}
+
+#: Per-knob help for the shared CLI pass-through flags.
+KNOB_HELP: dict[str, str] = {
+    "entry_credit": "Entry-credit objective: off | forecast | advantage.",
+    "trade_credit_mode": "Per-exit gate credit: realized | forecast | mix.",
+    "mix_weight": "Blend weight of the forecast term in trade_credit_mode=mix.",
+    "daily_observe": "Daily pooled sugar/shock ritual: on | off.",
+    "horizon_bars": "Entry-forecast horizon in 1-min bars (default 30).",
+    "r_scale": "Forecast tanh scale: tanh(r_fwd / r_scale).",
+    "a_scale": "Advantage tanh scale (Option B).",
+    "baseline_alpha": "Bucket-baseline EMA rate (Option B).",
+    "miss_weight": "Punishment weight for missed winners.",
+    "avoid_correct_weight": "Reward weight for correct avoids.",
+    "id_scale": "Identity-profile scale in [0, 1] (1.0 = unattenuated).",
+    "reward_gain": "Gate reward gain.",
+    "punishment_gain": "Gate punishment gain.",
+}
+
+
+def add_knob_args(parser) -> None:
+    """Add the TRAINING2 credit-knob pass-through flags to ``parser``.
+
+    Every flag defaults to ``None`` (= keep the ``BacktestConfig`` no-op
+    default), so the existing CLIs are bit-compatible at defaults.
+    """
+    for name in META_KNOBS:
+        parser.add_argument(
+            "--" + name.replace("_", "-"),
+            type=KNOB_TYPES.get(name, str),
+            default=None,
+            help=KNOB_HELP.get(name, name) + " (default: BacktestConfig value).",
+        )
+
+
+def knob_kwargs(namespace) -> dict:
+    """CLI namespace with ``None``-defaults -> ``BacktestConfig`` kwargs.
+
+    Only knobs explicitly given on the command line are passed through;
+    absent flags keep the config defaults (no-op pass-through).
+    """
+    return {
+        name: getattr(namespace, name)
+        for name in META_KNOBS
+        if getattr(namespace, name, None) is not None
+    }
+
+
+def meta_knobs(config: BacktestConfig) -> dict[str, str]:
+    """The A9 meta echo: every credit knob as its canonical meta string.
+
+    Knobs the installed ``BacktestConfig`` does not carry yet are skipped
+    (they cannot have influenced the run); the eval-side assertion skips
+    the same set, so both sides stay consistent.
+    """
+    return {
+        name: str(getattr(config, name))
+        for name in META_KNOBS
+        if hasattr(config, name)
+    }
+
+
+def meta_basket(config: BacktestConfig) -> list[str]:
+    """The effective training basket.
+
+    ``config.basket`` (the parsed ``--basket-file`` list) when given,
+    otherwise the loop's bound ``BASKET`` module attribute at run time.
+    """
+    explicit = getattr(config, "basket", None)
+    if explicit is not None:
+        return [str(symbol) for symbol in explicit]
+    return [str(symbol) for symbol in _loop.BASKET]
+
+
+def encode_baselines(baselines) -> dict[str, float]:
+    """Bucket baselines -> the JSON-safe meta form ``"sign|vol|dir"`` -> float."""
+    out: dict[str, float] = {}
+    for key, value in baselines.items():
+        if isinstance(key, (tuple, list)):
+            sign, vol, direction = (int(part) for part in key)
+            key = f"{sign}|{vol}|{direction}"
+        out[str(key)] = float(value)
+    return out
+
+
+def decode_baselines(raw: str | dict) -> dict[tuple[int, int, int], float]:
+    """The meta form back into ``{(sign, vol, dir): float}``."""
+    parsed = json.loads(raw) if isinstance(raw, str) else raw
+    out: dict[tuple[int, int, int], float] = {}
+    for key, value in parsed.items():
+        sign, vol, direction = (int(part) for part in str(key).split("|"))
+        out[(sign, vol, direction)] = float(value)
+    return out
+
+
+def _meta_baselines(config: BacktestConfig, result: RunResult) -> str | None:
+    """Option-B warm-start baselines for the meta (JSON string), or None."""
+    if getattr(config, "entry_credit", "off") != "advantage":
+        return None
+    baselines = getattr(result, "baselines", None)
+    if not baselines:
+        return None
+    return json.dumps(encode_baselines(baselines), sort_keys=True)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +386,12 @@ def train_larval(
         "chassis": config.chassis,
         "std_beta": str(config.std_beta),
         "std_tau_rec_ms": str(config.std_tau_rec_ms),
+        **meta_knobs(config),
+        "basket": json.dumps(meta_basket(config)),
     }
+    baselines_meta = _meta_baselines(config, result)
+    if baselines_meta is not None:
+        meta["initial_baselines"] = baselines_meta
     artifact = save_larval_weights(out_path, result.final_weights, fingerprint, meta)
     return TrainResult(
         run=result,

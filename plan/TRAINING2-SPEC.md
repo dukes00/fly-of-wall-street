@@ -1,6 +1,6 @@
 # TRAINING2 SPEC — entry skill + realized P&L
 
-**Status:** proposal for Duke sign-off (DESIGN v0.6 is source of truth; §8 lists every v0.7 amendment). Corrective pass after design review: the six review blockers are pinned in place (avoid-side credit, single-credit last-credit-wins rule, T-1 exit-scoring cost/default, overlap-robust G-A.1 statistics, artifact meta contract, turnover guard G-A.3).
+**Status:** RATIFIED by Duke 2026-09-16 (A1–A9 as DESIGN v0.7; §10 checklist closed; `MISS_WEIGHT=0.25`; objective = active trader choosing on information — A vs B decided empirically in Phase 0). Corrective pass after design review: the six review blockers are pinned in place (avoid-side credit, single-credit last-credit-wins rule, T-1 exit-scoring cost/default, overlap-robust G-A.1 statistics, artifact meta contract, turnover guard G-A.3).
 **Grounding:** all file:line refs are against `src/fruitfly/` at HEAD. Runtime claims trace to measured numbers: stripped ≈ 2–3 min/trading-day, whole ≈ 8.3 min/day, whole-fly eval ≈ 40 min/day (M1 Pro, 16 GB). Data: Alpaca IEX 1m free (D8), 2024+2025 fetched (~40 symbol-years), IEX depth verified to 2024+; ≥2016 unverified.
 
 ---
@@ -286,12 +286,12 @@ n ≥ ( (z_{α/2} + z_{power}) · σ / μ )²  =  (2.80 · σ / μ)²
 
 ## 10. DECISIONS-FOR-DUKE CHECKLIST
 
-- [ ] Ratify A1–A9 (§8) as DESIGN v0.7 (sign-off + changelog entry required; v0.6 stays source of truth until then).
-- [ ] Pick primary objective for Phase A: **A (entry-forecast)** recommended start, **B (advantage)** as challenger.
-- [ ] Set `MISS_WEIGHT` policy (0.25 proposed / 0 = misses unsupervised) — now governs both missed-winner paths: approached-but-passed buys **and** avoided run-ups (§2A). Pinned-by-spec (no Duke decision required): `AVOID_CORRECT_WEIGHT = 0.5` correct-avoid reward, the single-credit last-credit-wins rule, the T-1 encountered-ticker-only scoring default, the overlap-robust G-A.1 statistics, the artifact meta contract, and the G-A.3 turnover band.
-- [ ] `daily_observe` ablation allowed? (daily pooled ritual is a D6-designed ritual — turning it off is a behavior change beyond reward shaping).
-- [ ] Approve the 40-name training pool + commit the never-seen 20-name eval basket **before** Phase A.
-- [ ] Approve IEX depth verification spend (fetch tests) before committing mid-caps.
-- [ ] Approve exit grid E1–E4 scope (§5.2) and the T-1 exit-forecast path (§5.1).
-- [ ] Accept the eval wall-clock budget (~13 h/config-cell whole-fly; top-2 configs only).
-- [ ] Acceptance gates G-A/G-B/G-C (§6) as the phase-advance criteria.
+- [x] Ratify A1–A9 (§8) as DESIGN v0.7 — **RATIFIED by Duke 2026-09-16**; changelog entry added (DESIGN.md §16 v0.7).
+- [x] Pick primary objective for Phase A: **decided empirically in Phase 0** (§9.6, ratified) — A and B run head-to-head on the stripped lane; G-A gates pick the winner.
+- [x] Set `MISS_WEIGHT` policy — **0.25 ratified** (governs approached-but-passed buys AND avoided run-ups, §2A). Pinned-by-spec: `AVOID_CORRECT_WEIGHT = 0.5`, single-credit last-credit-wins, T-1 encountered-ticker-only scoring default, overlap-robust G-A.1, artifact meta contract, G-A.3 turnover band.
+- [x] `daily_observe` ablation allowed — **ratified** (A3: daily pooled ritual becomes ablatable; default "on", ablated in Phase A grid).
+- [x] Approve the 40-name training pool + commit the never-seen 20-name eval basket — **provisionally frozen** in `baskets/train40.txt` + `baskets/eval20-neverseen.txt` at Phase-0 close (all names listed pre-2024; eval20 disjoint from every trained basket; Duke holds veto until the Phase-0 commit).
+- [x] Approve IEX depth verification spend — **approved** (Phase 0 pre-commit gate: ≥300/390 median bars/day, report `reports/iex-depth.md`).
+- [x] Approve exit grid E1–E4 scope (§5.2) and the T-1 exit-forecast path (§5.1) — **ratified via A5**.
+- [x] Accept the eval wall-clock budget (~13 h/config-cell whole-fly; top-2 configs only) — **accepted** (Duke keeps the dashboard open during runs; runs proceed overnight-parallel where RAM allows).
+- [x] Acceptance gates G-A/G-B/G-C (§6) as the phase-advance criteria — **ratified**; Phase 0 additionally runs the ratified A-vs-B head-to-head through the G-A gates.

@@ -63,10 +63,15 @@ DAYS = ["2026-08-28", "2026-08-31", "2026-09-02", "2026-09-04"]
 
 @pytest.fixture()
 def fake_spx(monkeypatch):
-    """Deterministic stand-in for the real SPX benchmark (no cache reads)."""
+    """Deterministic stand-in for the benchmark (no cache reads).
+
+    The seam is ``benchmark_daily_returns`` (^GSPC daily close when
+    covered, else the SPY proxy from the fetched cache).
+    """
     monkeypatch.setattr(
-        eval_brains, "spx_daily_returns",
+        eval_brains, "benchmark_daily_returns",
         lambda days: {
+            "source": "spx",
             "daily_return_pct": [0.1 * (i + 1) for i in range(len(days))],
             "window_return_pct": 1.234,
             "max_drawdown_pct": 0.567,
@@ -84,16 +89,17 @@ def test_select_days_full_window():
 
 
 def test_select_days_takes_most_recent_pool():
-    avail = [f"2026-08-{d:02d}" for d in range(3, 15)]  # 12 days
+    avail = [f"2026-{m:02d}-{d:02d}" for m in (7, 8) for d in range(1, 24)]
+    assert len(avail) == 46  # > RECENT_POOL = 40
     got = eval_brains.select_days(avail, 3)
-    assert got[0] == avail[-10]  # window starts at the 10th-most-recent day
+    assert got[0] == avail[-40]  # window starts at the 40th-most-recent day
     assert got[-1] == avail[-1]
 
 
 def test_select_days_caps_at_the_recent_pool():
-    avail = [f"2026-08-{d:02d}" for d in range(3, 15)]  # 12 days
-    with pytest.raises(ValueError, match="exceeds the 10"):
-        eval_brains.select_days(avail, 11)
+    avail = [f"2026-{m:02d}-{d:02d}" for m in (7, 8) for d in range(1, 24)]
+    with pytest.raises(ValueError, match="exceeds the 40"):
+        eval_brains.select_days(avail, 41)
 
 
 def test_select_days_evenly_spaced_keeps_endpoints():
@@ -272,8 +278,12 @@ def test_select_days_within_bounded_pool():
     assert got == ["2026-08-05", "2026-08-10"]
 
 
-def _install_fake_run(monkeypatch, tmp_path, calls):
-    """Wire every run seam: bars days, chassis, weights, run_backtest."""
+def _install_fake_run(monkeypatch, tmp_path, calls, meta=None):
+    """Wire every run seam: bars days, chassis, weights, run_backtest.
+
+    ``meta`` overrides the fake artifact's meta (default: a legacy
+    pre-A9 artifact with no recorded basket or knobs).
+    """
     from types import SimpleNamespace
 
     import fruitfly.connectome
@@ -294,11 +304,11 @@ def _install_fake_run(monkeypatch, tmp_path, calls):
                                n_orders=3, n_deaths=0)
 
     monkeypatch.setattr(fruitfly.loop, "run_backtest", fake_run)
+    if meta is None:
+        meta = {"end": "2026-01-01", "seed": "7"}
     monkeypatch.setattr(
         fruitfly.train, "load_larval_weights",
-        lambda artifact, brain: SimpleNamespace(
-            weights=None, meta={"end": "2026-01-01", "seed": "7"}))
-    import fruitfly.connectome
+        lambda artifact, brain: SimpleNamespace(weights=None, meta=meta))
     monkeypatch.setattr(fruitfly.connectome, "load_stripped_chassis",
                         lambda: object())
     cache_days = [f"2026-08-{d:02d}" for d in range(3, 15)]
@@ -312,7 +322,12 @@ def test_main_basket_and_period_reach_seam_and_receipt(tmp_path, monkeypatch,
     from fruitfly import data as fdata
     from fruitfly import loop as floop
     calls: list[dict] = []
-    _install_fake_run(monkeypatch, tmp_path, calls)
+    # A custom --basket is a non-default config: the fake artifact's meta
+    # must record the same basket (A9 fail-closed rule for legacy artifacts).
+    _install_fake_run(
+        monkeypatch, tmp_path, calls,
+        meta={"end": "2026-01-01", "seed": "7",
+              "basket": json.dumps(["AAA", "BBB"])})
     orig_data, orig_loop = list(fdata.BASKET), list(floop.BASKET)
     results_dir, report = tmp_path / "res", tmp_path / "r.md"
     (tmp_path / "x.npz").write_bytes(b"fake")

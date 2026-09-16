@@ -372,6 +372,125 @@ def test_observe_trade_validates_snapshot_shape(chassis):
 
 
 
+# --- compact per-encounter credit (observe_trade_compact) -----------------------
+
+
+def _busy_spikes() -> tuple[np.ndarray, np.ndarray]:
+    return (
+        spikes({KC0: 1.5, KC1: 0.5, KC2: 2.0}),
+        spikes({MBON0: 1.0, MBON1: 0.75, MBON3: 1.25}),
+    )
+
+
+def test_compact_driver_rebuilds_eligibility_driver_bitwise(chassis):
+    p = Plasticity(chassis)
+    # non-fresh habituation first, so the gating actually bites
+    p.observe(NeuromodState(), spikes({KC1: 1.0}), spikes({MBON0: 1.0}))
+    pre, post = _busy_spikes()
+    kc_gated, post_c = p.compact_driver(pre, post)
+    rebuilt = kc_gated[:, None] * post_c[None, :] * p.support
+    assert rebuilt.tobytes() == p.eligibility_driver(pre, post).tobytes()
+
+
+def test_observe_trade_compact_matches_observe_trade_bitwise(chassis):
+    """Compact snapshot credit is numerically identical to the full-trace path."""
+    full = Plasticity(chassis, learning_rate=2.0)
+    compact = Plasticity(chassis, learning_rate=2.0)
+    encounters = [
+        (
+            spikes({KC0: 1.5, KC2: 0.5}),
+            spikes({MBON0: 1.0, MBON3: 0.75}),
+            NeuromodState(reward=1.0, hunger=0.5, arousal=0.2),
+        ),
+        (
+            spikes({KC1: 2.0}),
+            spikes({MBON1: 1.25, MBON2: 0.5}),
+            NeuromodState(punishment=0.75, arousal=0.1),
+        ),
+    ]
+    for pre, post, state in encounters:
+        full.observe_trade(state, full.eligibility_driver(pre, post))
+        compact.observe_trade_compact(
+            (*compact.compact_driver(pre, post), None),
+            state.reward,
+            state.punishment,
+            hunger=state.hunger,
+            arousal=state.arousal,
+        )
+    assert compact.weights.tobytes() == full.weights.tobytes()
+
+
+def test_observe_trade_compact_is_pure_over_live_state(chassis):
+    p = Plasticity(chassis, learning_rate=2.0)
+    p.observe(NeuromodState(punishment=1.0), spikes({KC0: 1.0}), spikes({MBON0: 1.0}))
+    live_elig = p.eligibility.copy()
+    live_hab = p.habituation.copy()
+    weights_before = p.weights.copy()
+    p.observe_trade_compact((*p.compact_driver(*_busy_spikes()), None), 1.0, 0.0)
+    assert p.eligibility.tobytes() == live_elig.tobytes()
+    assert p.habituation.tobytes() == live_hab.tobytes()
+    assert not np.array_equal(p.weights, weights_before)  # the credit itself applied
+
+
+def test_observe_trade_compact_validates_compact(chassis):
+    p = Plasticity(chassis)
+    kc_n, mbon_n = p.kc_index.size, p.mbon_index.size
+    with pytest.raises(ValueError, match="kc_activity"):
+        p.observe_trade_compact((np.zeros(kc_n + 1), np.zeros(mbon_n), None), 1.0, 0.0)
+    with pytest.raises(ValueError, match="compact post"):
+        p.observe_trade_compact((np.zeros(kc_n), np.zeros(mbon_n + 1), None), 1.0, 0.0)
+    with pytest.raises(ValueError, match="support"):
+        p.observe_trade_compact(
+            (np.zeros(kc_n), np.zeros(mbon_n), np.zeros(3, dtype=bool)), 1.0, 0.0
+        )
+
+
+def test_observe_trade_compact_accepts_per_mbon_support(chassis):
+    p = Plasticity(chassis, learning_rate=2.0)
+    col_support = p.support.any(axis=0)
+    weights_before = p.weights.copy()
+    p.observe_trade_compact((*p.compact_driver(*_busy_spikes()), col_support), 1.0, 0.0)
+    # structural support still masks the final delta: only real synapses moved
+    moved = p.weights - weights_before
+    assert np.all(moved[~p.support] == 0.0)
+
+
+# --- calibrated gate gains (TRAINING2-SPEC §4.1) ---------------------------------
+
+
+def test_gain_defaults_are_the_incumbent_noop(chassis):
+    p = Plasticity(chassis)
+    assert p.reward_gain == 1.0
+    assert p.punishment_gain == 1.0
+
+
+def test_reward_gain_scales_reward_drive(chassis):
+    state = NeuromodState(reward=1.0, hunger=0.5)
+    assert Plasticity(chassis).reward_drive(state) == pytest.approx(1.5)
+    assert Plasticity(chassis, reward_gain=1.5).reward_drive(state) == pytest.approx(
+        1.5 * 1.0 * (1.0 + 1.0 * 0.5)
+    )
+
+
+def test_asymmetric_gate_breaks_reward_punishment_tie(chassis):
+    """d = reward_drive − punishment_gain·punishment reflects both gains."""
+    pre, post = spikes({KC0: 1.0}), spikes({MBON0: 1.0})
+    state = NeuromodState(reward=1.0, punishment=1.0)
+    sym = Plasticity(chassis, learning_rate=2.0)
+    sym.observe(state, pre, post)  # d = 1.0 − 1.0 = 0 → no learning
+    assert np.array_equal(sym.weights, sym.baseline * sym.support)
+    asym = Plasticity(chassis, learning_rate=2.0, reward_gain=1.5, punishment_gain=1.0)
+    asym.observe(state, pre, post)  # d = 1.5 − 1.0 = 0.5 → approach potentiation
+    assert asym.weights[0, 0] > W00
+
+
+def test_punishment_gain_scales_punishment_drive(chassis):
+    p = Plasticity(chassis, learning_rate=2.0, punishment_gain=2.0)
+    pre, post = spikes({KC0: 1.0}), spikes({MBON2: 1.0})
+    p.observe(NeuromodState(reward=1.0, punishment=1.0), pre, post)
+    assert p.weights[0, 2] > W02  # d = 1.0 − 2.0·1.0 = −1 → avoid potentiation
+
+
 # --- determinism (byte-identical double run) ------------------------------------
 
 
