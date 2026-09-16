@@ -1,15 +1,20 @@
-"""Tests for the T14 live dashboard (offline, synthetic run dir, no network).
+"""Tests for the T14 live dashboard v3 (offline, synthetic run dir, no network).
 
-Covers the four panel groups reconstructed from receipts by ``build_state``
-(equity/drawdown, neural state, trading + FIFO positions, aggregate P&L),
-schema tolerance for unknown and upcoming event types (anchor, trade_credit),
-the HTTP surface, the SSE push loop, and CLI registration.
+Covers the four glance questions reconstructed from receipts by
+``build_state`` (glance strip: status/age/rate/latest bar; activity timeline
+with filter categories; header P&L — day/cumulative/realized/unrealized —
+plus the equity/drawdown, neural, trading + FIFO positions and per-ticker
+league panels), schema tolerance for unknown and upcoming event types
+(anchor, trade_credit, entry_credit and fully unknown types), the embedded
+sortable/glance page markup, the HTTP surface, the SSE push loop, and CLI
+registration.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -115,12 +120,23 @@ def test_index_serves_static_page(client: TestClient) -> None:
     assert "text/html" in r.headers["content-type"]
     body = r.text
     for panel in ("panel-equity", "panel-neural", "panel-decisions",
+                  "panel-timeline", "panel-activity", "panel-sniff",
                   "panel-trading", "panel-pnl", "panel-positions",
                   "panel-league", "panel-events"):
         assert panel in body
     assert "<canvas" in body
     assert 'new EventSource("/api/stream")' in body
-
+    # glance strip: sticky header carrying the four glance fields
+    for gid in ("g-dot", "g-age", "g-rate", "g-bar"):
+        assert f'id="{gid}"' in body
+    assert "#glance { position: sticky;" in body
+    # sortable tables: click-to-sort headers with aria-sort plumbing
+    assert body.count('class="sortable"') == 4
+    assert 'data-key="realized_pnl"' in body
+    assert "aria-sort" in body
+    # timeline filter chips
+    for chip in ("all", "orders", "decisions", "credits", "system"):
+        assert f'data-filter="{chip}"' in body
 
 def test_state_route_200_all_panels(client: TestClient) -> None:
     r = client.get("/api/state")
@@ -186,6 +202,31 @@ def test_state_route_200_all_panels(client: TestClient) -> None:
     }]
     # event log
     assert s["n_events"] == 17
+    # glance strip + v3 aggregates (fields present; wall-clock status varies)
+    assert s["status"] in ("live", "quiet", "stalled")
+    assert s["last_event_age_s"] is None or isinstance(s["last_event_age_s"], float)
+    assert s["events_per_min"] >= 0.0
+    assert s["latest_bar_ts"] == "2026-08-18T13:32:00+00:00"
+    assert s["day_pnl"] is None  # single-day run: no prior day's close yet
+    assert s["cum_pnl"] == 100.0  # equity - hatch equity
+    # per-ticker league
+    assert s["league"]["AAPL"] == {
+        "trades": 2, "wins": 1, "losses": 0, "realized": 100.0, "win_rate": 1.0}
+    assert s["league"]["MSFT"]["trades"] == 1
+    assert s["league"]["MSFT"]["win_rate"] is None  # no booked verdict yet
+    # per-day activity + last-sniff card
+    assert s["daily_activity"] == {"2026-08-18": {
+        "orders": 3, "encounters": 2, "structural": 0}}
+    assert s["last_sniff"]["ticker"] == "MSFT"
+    assert s["last_sniff"]["intensity"] == 0.15
+    assert s["last_sniff"]["balance"] == -0.03
+    assert s["last_sniff"]["structural_score"] is None
+    assert s["last_sniff"]["action"] == "avoid"
+    # activity timeline: 17 events - 2 untimed hatches - 2 encounters
+    types = [r["type"] for r in s["timeline"]]
+    assert len(types) == 13
+    assert types[0] == "hologram"  # newest first, unknown type included
+    assert "encounter" not in types
 
 
 def test_unknown_event_type_is_tolerated(run_dir: Path) -> None:
@@ -267,6 +308,138 @@ def test_all_routes_200(run_dir: Path) -> None:
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+def test_glance_strip_computed(run_dir: Path) -> None:
+    """Status dot, last-event age, events/min and latest bar vs a pinned clock."""
+    now = datetime(2026, 8, 19, 13, 0, 2, tzinfo=UTC).timestamp()
+    s = build_state(run_dir, now=now)
+    assert s["status"] == "live"  # latest event (hologram) is 1s old
+    assert s["last_event_age_s"] == 1.0
+    assert s["events_per_min"] == 0.2  # death + hologram in the last 10 sim-min
+    assert s["latest_bar_ts"] == "2026-08-18T13:32:00+00:00"
+    assert build_state(run_dir, now=now + 400)["status"] == "quiet"  # amber
+    assert build_state(run_dir, now=now + 10**6)["status"] == "stalled"  # red
+
+
+def test_glance_without_events(run_dir: Path) -> None:
+    """Bars without events: amber quiet, no age, zero rate."""
+    (run_dir / "events.jsonl").unlink()
+    s = build_state(run_dir)
+    assert s["status"] == "quiet"
+    assert s["last_event_age_s"] is None
+    assert s["events_per_min"] == 0.0
+
+
+def test_timeline_rows_content(run_dir: Path) -> None:
+    s = build_state(run_dir)
+    rows = s["timeline"]
+    assert rows[0]["type"] == "hologram"
+    assert rows[0]["cat"] == "system"
+    assert rows[0]["desc"] == "hologram"
+    orders = [r for r in rows if r["type"] == "order"]
+    assert [r["desc"] for r in orders] == [  # newest first
+        "AAPL sell 40 @ 260.00 — cap · pnl +100.00",
+        "MSFT buy 50 @ 500.00 — dust",
+        "AAPL buy 100 @ 250.00 — approach",
+    ]
+    assert [r["cat"] for r in orders] == ["orders"] * 3
+    credit = next(r for r in rows if r["type"] == "trade_credit")
+    assert credit["cat"] == "credits"
+    assert "pnl +100.00" in credit["desc"]
+    dec = next(r for r in rows if r["type"] == "decision"
+               and r["ts"].endswith("13:31:30+00:00"))
+    assert dec["cat"] == "decisions"
+    assert dec["action"] == "avoid"
+    assert dec["desc"] == "MSFT avoid — valence_flip"
+
+
+def test_timeline_capped_server_side(run_dir: Path) -> None:
+    (run_dir / "events.jsonl").write_text("".join(
+        json.dumps({"type": "order",
+                    "ts": f"2026-08-18T{13 + i // 60:02d}:{i % 60:02d}:00+00:00",
+                    "ticker": "AAPL", "side": "buy", "reason": "approach",
+                    "shares": 1, "price": 1.0, "realized_pnl": None},
+                   sort_keys=True) + "\n"
+        for i in range(600)))
+    s = build_state(run_dir)
+    assert len(s["timeline"]) == 200  # capped, newest kept
+    assert s["timeline"][0]["ts"] == "2026-08-18T22:59:00+00:00"
+    assert s["timeline"][-1]["ts"] == "2026-08-18T19:40:00+00:00"
+
+
+def test_day_pnl_across_days(run_dir: Path) -> None:
+    """DAY P&L = equity vs the prior day's close; CUM P&L vs hatch equity."""
+    (run_dir / "equity.csv").write_text(
+        "timestamp,equity,cash,n_positions\n"
+        "2026-08-18T15:00:00+00:00,100000.00,100000.00,0\n"
+        "2026-08-18T20:00:00+00:00,101000.00,99000.00,1\n"
+        "2026-08-19T15:00:00+00:00,100500.00,98500.00,1\n"
+        "2026-08-19T20:00:00+00:00,100800.00,98200.00,1\n"
+    )
+    s = build_state(run_dir)
+    assert s["day_pnl"] == -200.0  # 100800 - prior day close 101000
+    assert s["day_pnl_prior_close"] == 101000.0
+    assert s["cum_pnl"] == 800.0  # vs the fixture's hatch equity of 100000
+
+
+def test_league_win_rate(run_dir: Path) -> None:
+    (run_dir / "events.jsonl").write_text("".join(
+        json.dumps(e, sort_keys=True) + "\n" for e in [
+            {"type": "order", "ts": "2026-08-18T13:31:00+00:00", "ticker": "AAPL",
+             "side": "sell", "reason": "cap", "shares": 10, "price": 10.0,
+             "realized_pnl": 50.0},
+            {"type": "order", "ts": "2026-08-18T13:32:00+00:00", "ticker": "AAPL",
+             "side": "sell", "reason": "cap", "shares": 10, "price": 10.0,
+             "realized_pnl": -20.0},
+            {"type": "order", "ts": "2026-08-18T13:33:00+00:00", "ticker": "AAPL",
+             "side": "buy", "reason": "approach", "shares": 10, "price": 10.0,
+             "realized_pnl": None},
+        ]))
+    lg = build_state(run_dir)["league"]["AAPL"]
+    assert lg["trades"] == 3
+    assert lg["wins"] == 1 and lg["losses"] == 1
+    assert lg["win_rate"] == 0.5  # over the two booked verdicts
+    assert lg["realized"] == 30.0
+
+
+def test_last_sniff_card_fields(run_dir: Path) -> None:
+    (run_dir / "events.jsonl").write_text("".join(
+        json.dumps(e, sort_keys=True) + "\n" for e in [
+            {"type": "encounter", "ts": "2026-08-18T13:31:00+00:00",
+             "ticker": "AAPL", "intensity": 0.55, "balance": 0.02,
+             "raw_balance": 0.0325, "structural_score": 0.4,
+             "balance_used": 0.04},
+            {"type": "decision", "ts": "2026-08-18T13:31:00+00:00",
+             "ticker": "AAPL", "action": "buy", "reason": "approach"},
+            {"type": "encounter", "ts": "2026-08-18T13:32:00+00:00",
+             "ticker": "MSFT", "intensity": 0.2, "balance": -0.01,
+             "raw_balance": -0.03, "structural_score": 0.0,
+             "balance_used": -0.03},
+        ]))
+    sn = build_state(run_dir)["last_sniff"]
+    assert sn["ticker"] == "MSFT"  # the LATEST encounter
+    assert sn["intensity"] == 0.2
+    assert sn["balance"] == -0.01
+    assert sn["balance_used"] == -0.03
+    assert sn["structural_score"] == 0.0
+    assert sn["action"] is None  # no decision followed this sniff yet
+
+
+def test_v07_events_render_in_timeline(run_dir: Path) -> None:
+    """Upcoming v0.7 types: credit-named → credits, truly unknown → system."""
+    (run_dir / "events.jsonl").write_text("".join(
+        json.dumps(e, sort_keys=True) + "\n" for e in [
+            {"type": "entry_credit", "ts": "2026-08-18T13:31:00+00:00",
+             "ticker": "MSFT", "shares": 10, "price": 500.0},
+            {"type": "holo_shock", "ts": "2026-08-18T13:31:10+00:00",
+             "valence": 0.5},
+        ]))
+    rows = build_state(run_dir)["timeline"]
+    assert [r["type"] for r in rows] == ["holo_shock", "entry_credit"]
+    assert [r["cat"] for r in rows] == ["system", "credits"]
+    assert "valence=0.5" in rows[0]["desc"]  # generic field summary
+    assert "MSFT" in rows[1]["desc"]
 
 
 def test_events_route_tail(client: TestClient) -> None:
