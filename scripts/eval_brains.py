@@ -32,6 +32,8 @@ import argparse
 import hashlib
 import json
 import sys
+from contextlib import contextmanager
+from datetime import date
 from importlib import import_module
 from pathlib import Path
 
@@ -171,6 +173,8 @@ def evaluate_arm(
     seed: int,
     std_beta: float | None,
     std_tau_rec_ms: float | None,
+    period: dict[str, str] | None,
+    basket: list[str] | None,
     results_dir: Path = RESULTS_DIR,
 ) -> dict:
     """Replay every held-out day with the artifact's trained weights.
@@ -187,11 +191,17 @@ def evaluate_arm(
 
     brain = load_whole_fly() if chassis == "whole" else load_stripped_chassis()
     lw = load_larval_weights(artifact, brain)
+    train_start = str(lw.meta.get("start", ""))
     train_end = str(lw.meta.get("end", ""))
-    if days[0] <= train_end:
+    # Overlap guard (audit 2026-09-15, amended 2026-09-16): days BEFORE the
+    # training window are genuine out-of-sample (no leakage possible from a
+    # later-trained artifact); only days INSIDE [train_start, train_end] are
+    # refused.
+    if days[0] <= train_end and days[-1] >= train_start:
         raise ValueError(
-            f"held-out day {days[0]} is not after the artifact's training "
-            f"window end {train_end}; refusing to evaluate on training days"
+            f"held-out window {days[0]}..{days[-1]} overlaps the artifact's "
+            f"training window {train_start}..{train_end}; refusing to "
+            f"evaluate on training days"
         )
 
     runs_root = results_dir / "runs" / chassis
@@ -220,6 +230,8 @@ def evaluate_arm(
         "seed": seed,
         "std_beta": std_beta,
         "std_tau_rec_ms": std_tau_rec_ms,
+        **({"period": period} if period is not None else {}),
+        **({"basket": basket} if basket is not None else {}),
         "days": per_day,
         "totals": {
             "mean_return_pct": round(
@@ -332,13 +344,19 @@ def render_report(
                 f"| {WHOLE_PENDING['window']} | **PENDING** |"
             )
             continue
+        meta_extra = ""
+        if "period" in rc:
+            meta_extra += (f" period={rc['period']['start']}"
+                           f"..{rc['period']['end']}")
+        if "basket" in rc:
+            meta_extra += f" basket={','.join(rc['basket'])}"
         meta = rc["artifact_meta"]
         lines.append(
             f"| {rc['arm']} | {rc['chassis']} | `{rc['artifact']}` "
             f"| {rc['artifact_md5'][:12]}… | {meta.get('start', '?')}"
             f"..{meta.get('end', '?')} | seed={meta.get('seed', '?')} "
             f"bars={meta.get('n_bars', '?')} deaths={meta.get('n_deaths', '?')} "
-            f"std=({rc['std_beta']},{rc['std_tau_rec_ms']}) |"
+            f"std=({rc['std_beta']},{rc['std_tau_rec_ms']}){meta_extra} |"
         )
 
     notes = [
@@ -371,6 +389,54 @@ def render_report(
 # ---------------------------------------------------------------------------
 
 
+def _parse_iso_day(raw: str | None, flag: str) -> str | None:
+    if raw is None:
+        return None
+    try:
+        date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"{flag} must be YYYY-MM-DD, got {raw!r}") from exc
+    return raw
+
+
+def _parse_basket(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    basket = [symbol.strip() for symbol in raw.split(",")]
+    if len(basket) < 2 or any(not symbol for symbol in basket):
+        raise ValueError(
+            "--basket needs at least 2 non-empty comma-separated symbols, "
+            f"got {raw!r}"
+        )
+    return basket
+
+
+@contextmanager
+def _basket_override(basket: list[str] | None):
+    """Set the module-level ``BASKET`` seams for the duration of the run.
+
+    ``fruitfly.loop`` binds ``BASKET`` at import time (``from fruitfly.data
+    import BASKET``), so BOTH module attributes must be patched; deferred
+    importers (``fruitfly.data`` consumers like ``cache_trading_days`` and
+    ``fruitfly.scoreboard``) read ``fruitfly.data.BASKET`` at call time.
+    """
+    if basket is None:
+        yield
+        return
+    import fruitfly.data
+    import fruitfly.loop
+
+    modules = (fruitfly.data, fruitfly.loop)
+    saved = {id(m): m.BASKET for m in modules}
+    try:
+        for module in modules:
+            module.BASKET = list(basket)
+        yield
+    finally:
+        for module in modules:
+            module.BASKET = saved[id(module)]
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     if args.days < 1:
         raise ValueError(f"--days must be >= 1, got {args.days}")
@@ -395,14 +461,48 @@ def main(argv: list[str] | None = None) -> int:
                         help="Receipt + run-artifact directory.")
     parser.add_argument("--report", default=str(REPORT_PATH),
                         help="Markdown report to (re)render.")
+    parser.add_argument(
+        "--start", type=str, default=None, metavar="YYYY-MM-DD",
+        help="Bound the held-out day pool to days >= this date (inclusive).")
+    parser.add_argument(
+        "--end", type=str, default=None, metavar="YYYY-MM-DD",
+        help="Bound the held-out day pool to days <= this date (inclusive).")
+    parser.add_argument(
+        "--basket", type=str, default=None,
+        help="Comma-separated ticker basket overriding the trained basket "
+             "for the cache day pool and the backtest (>= 2 symbols).")
     args = parser.parse_args(argv)
     _validate_args(args)
+    if args.start and args.end and args.start > args.end:
+        raise ValueError(f"--start {args.start} must be <= --end {args.end}")
+    start = _parse_iso_day(args.start, "--start")
+    end = _parse_iso_day(args.end, "--end")
+    basket = _parse_basket(args.basket)
 
-    days = select_days(cache_trading_days(), args.days)
-    print(f"eval {args.chassis}: {args.artifact} seed {args.seed}, "
-          f"held-out {days[0]}..{days[-1]} ({len(days)} days)")
-    evaluate_arm(args.chassis, args.artifact, days, args.seed,
-                 args.std_beta, args.std_tau_rec_ms, Path(args.results_dir))
+    available = cache_trading_days()
+    if start is not None or end is not None:
+        available = [
+            day for day in available
+            if (start is None or day >= start) and (end is None or day <= end)
+        ]
+        if not available:
+            raise ValueError(
+                f"--start/--end bound [{start or '*'}, {end or '*'}] leaves no "
+                f"trading days in the cache")
+    period = (
+        {"start": start, "end": end}
+        if start is not None or end is not None else None
+    )
+
+    with _basket_override(basket):
+        days = select_days(available, args.days)
+        basket_note = f", basket {','.join(basket)}" if basket else ""
+        print(f"eval {args.chassis}: {args.artifact} seed {args.seed}"
+              f"{basket_note}, "
+              f"held-out {days[0]}..{days[-1]} ({len(days)} days)")
+        evaluate_arm(args.chassis, args.artifact, days, args.seed,
+                     args.std_beta, args.std_tau_rec_ms, period, basket,
+                     Path(args.results_dir))
     receipts = load_receipts(Path(args.results_dir))
     render_report(receipts, Path(args.report))
     print(f"report -> {args.report}")

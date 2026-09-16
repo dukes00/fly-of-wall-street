@@ -12,6 +12,7 @@ import json
 import math
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -256,6 +257,142 @@ def test_receipt_totals_math():
 
 
 def test_main_rejects_nonpositive_days():
+    with pytest.raises(ValueError, match="--days"):
+        eval_brains.main(["--chassis", "stripped", "--artifact", "x.npz",
+                          "--days", "0"])
+
+
+
+
+def test_select_days_within_bounded_pool():
+    """A start/end-bounded available list selects only inside the bound."""
+    avail = [f"2026-08-{d:02d}" for d in range(3, 15)]  # 12 days
+    bounded = [d for d in avail if "2026-08-05" <= d <= "2026-08-10"]
+    got = eval_brains.select_days(bounded, 2)
+    assert got == ["2026-08-05", "2026-08-10"]
+
+
+def _install_fake_run(monkeypatch, tmp_path, calls):
+    """Wire every run seam: bars days, chassis, weights, run_backtest."""
+    from types import SimpleNamespace
+
+    import fruitfly.connectome
+    import fruitfly.data
+    import fruitfly.loop
+    import fruitfly.train
+
+    def fake_run(config):
+        calls.append({
+            "day": config.start,
+            "data_basket": list(fruitfly.data.BASKET),
+            "loop_basket": list(fruitfly.loop.BASKET),
+        })
+        config.out_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"equity": [100_000.0, 101_000.0]}).to_csv(
+            config.out_dir / "equity.csv", index=False)
+        return SimpleNamespace(run_dir=config.out_dir, final_equity=101_000.0,
+                               n_orders=3, n_deaths=0)
+
+    monkeypatch.setattr(fruitfly.loop, "run_backtest", fake_run)
+    monkeypatch.setattr(
+        fruitfly.train, "load_larval_weights",
+        lambda artifact, brain: SimpleNamespace(
+            weights=None, meta={"end": "2026-01-01", "seed": "7"}))
+    import fruitfly.connectome
+    monkeypatch.setattr(fruitfly.connectome, "load_stripped_chassis",
+                        lambda: object())
+    cache_days = [f"2026-08-{d:02d}" for d in range(3, 15)]
+    monkeypatch.setattr(eval_brains, "cache_trading_days",
+                        lambda: list(cache_days))
+    return cache_days
+
+
+def test_main_basket_and_period_reach_seam_and_receipt(tmp_path, monkeypatch,
+                                                       fake_spx):
+    from fruitfly import data as fdata
+    from fruitfly import loop as floop
+    calls: list[dict] = []
+    _install_fake_run(monkeypatch, tmp_path, calls)
+    orig_data, orig_loop = list(fdata.BASKET), list(floop.BASKET)
+    results_dir, report = tmp_path / "res", tmp_path / "r.md"
+    (tmp_path / "x.npz").write_bytes(b"fake")
+    eval_brains.main([
+        "--chassis", "stripped", "--artifact", str(tmp_path / "x.npz"),
+        "--days", "2", "--std-beta", "0.1", "--std-tau-rec-ms", "500",
+        "--start", "2026-08-05", "--end", "2026-08-10",
+        "--basket", "AAA,BBB",
+        "--results-dir", str(results_dir), "--report", str(report),
+    ])
+    receipt = json.loads((results_dir / "results_stripped.json").read_text())
+    assert receipt["period"] == {"start": "2026-08-05", "end": "2026-08-10"}
+    assert receipt["basket"] == ["AAA", "BBB"]
+    assert all(c["data_basket"] == ["AAA", "BBB"] for c in calls)
+    assert all(c["loop_basket"] == ["AAA", "BBB"] for c in calls)
+    assert all("2026-08-05" <= c["day"] <= "2026-08-10" for c in calls)
+    assert list(fdata.BASKET) == orig_data
+    assert list(floop.BASKET) == orig_loop
+    text = report.read_text()
+    assert "period=2026-08-05..2026-08-10" in text
+    assert "basket=AAA,BBB" in text
+
+
+def test_main_default_receipt_has_no_period_or_basket(tmp_path, monkeypatch,
+                                                      fake_spx):
+    calls: list[dict] = []
+    _install_fake_run(monkeypatch, tmp_path, calls)
+    results_dir, report = tmp_path / "res", tmp_path / "r.md"
+    (tmp_path / "x.npz").write_bytes(b"fake")
+    eval_brains.main([
+        "--chassis", "stripped", "--artifact", str(tmp_path / "x.npz"),
+        "--days", "2",
+        "--results-dir", str(results_dir), "--report", str(report),
+    ])
+    receipt = json.loads((results_dir / "results_stripped.json").read_text())
+    assert "period" not in receipt and "basket" not in receipt
+    assert "period=" not in report.read_text()
+    assert "basket=" not in report.read_text()
+
+
+def test_main_rejects_start_after_end():
+    with pytest.raises(ValueError, match="must be <= --end"):
+        eval_brains.main(["--chassis", "stripped", "--artifact", "x.npz",
+                          "--start", "2026-09-02", "--end", "2026-08-28"])
+
+
+def test_main_rejects_single_symbol_basket():
+    with pytest.raises(ValueError, match="--basket"):
+        eval_brains.main(["--chassis", "stripped", "--artifact", "x.npz",
+                          "--basket", "AAA"])
+
+
+def test_basket_override_reaches_cache_trading_days(tmp_path, monkeypatch):
+    """The day pool uses the overridden basket via fruitfly.data.BASKET."""
+    import fruitfly.data
+    frames = {}
+    for symbol in ("AAA", "BBB"):
+        path = tmp_path / f"{symbol}.parquet"
+        pd.DataFrame({"timestamp": pd.to_datetime(
+            ["2026-08-05", "2026-08-06"], utc=True)}).to_parquet(path)
+        frames[symbol] = path
+    monkeypatch.setattr(
+        fruitfly.data, "cache_path",
+        lambda symbol: frames.get(symbol, tmp_path / "missing.parquet"))
+    with eval_brains._basket_override(["AAA", "BBB"]):
+        assert eval_brains.cache_trading_days() == [
+            "2026-08-05", "2026-08-06"]
+    with pytest.raises(ValueError, match="no trading days"):
+        eval_brains.cache_trading_days()
+
+
+def test_basket_override_restores_original():
+    import fruitfly.data
+    import fruitfly.loop
+    orig_data, orig_loop = fruitfly.data.BASKET, fruitfly.loop.BASKET
+    with eval_brains._basket_override(["AAA", "BBB"]):
+        assert fruitfly.data.BASKET == ["AAA", "BBB"]
+        assert fruitfly.loop.BASKET == ["AAA", "BBB"]
+    assert fruitfly.data.BASKET is orig_data
+    assert fruitfly.loop.BASKET is orig_loop
     with pytest.raises(ValueError, match="--days"):
         eval_brains.main(["--chassis", "stripped", "--artifact", "x.npz",
                           "--days", "0"])
