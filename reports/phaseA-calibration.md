@@ -40,3 +40,15 @@ G-B target (§6): median closed-trade realized P&L > 0 on the training window; u
 ## Reproduction
 
 Each cell: the base command in `reports/h2h-avsb-phase0.md` plus the knob delta above, `--out-dir data/runs/pa-<cell>`; gates via `uv run python scripts/gates.py --run-dir data/runs/pa-<cell> --reference data/runs/h2h-reference --market-dir data/market/history`.
+
+## Addendum — G-B early signal from the one completed exit cell (local stop 2026-09-16)
+
+Training was halted locally (Duke: 16× faster whole-fly on a second machine; campaign continues there). One exit-grid cell had completed: `pb-e1-trail1` (tight-miss winner + `--trailing-stop-pct 1.0`). G-B statistics (median closed-trade P&L, FIFO-paired; capture vs SPY daily closes):
+
+| run | trades (W/L) | median closed P&L | Σ P&L | up-cap | down-cap |
+|---|---|---|---|---|---|
+| pb-e1-trail1 (winner + 1% trail) | 529 (277/246) | **+$0.84** | +$1,926 | 0.43 | −0.19 |
+| pa-b-baseline (winner, no stops) | 616 (327/286) | **+$1.36** | +$1,964 | 0.51 | +0.19 |
+| h2h-reference (incumbent) | 481 (179/302) | **−$8.40** | −$6,432 | −0.05 | 3.55 |
+
+**Finding:** the entry-credit fix alone already flips median closed-trade P&L positive (G-B's primary criterion) — the reference fly shows the documented pathology (median negative, capture inverted 3.55 down / −0.05 up). The 1% trail keeps G-B positive but dilutes the median (0.84 vs 1.36): the exit grid's remaining job is proving *no dilution* (trail 2–3%, ATR, valence-off, hold-to-close) rather than rescue. Whole-fly confirm + remaining cells → machine 2.
